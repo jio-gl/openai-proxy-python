@@ -155,7 +155,7 @@ class BaseAPIProxy:
                 )
             ) as response:
                 # Log response details including rate limits
-                status_code, response_headers = await log_response(response, True)
+                status_code, response_headers = await log_response(response, request_id, True)
                 
                 if status_code == 429:
                     error_msg = json.dumps({
@@ -762,7 +762,8 @@ class OpenAIProxy(BaseAPIProxy):
             headers=headers
         )
 
-    async def _log_response(self, response, is_streaming=False):
+    async def _log_response(self, response, request_id, is_streaming=False):
+        """Log response details including rate limits and errors"""
         status_code = response.status_code
         response_headers = dict(response.headers)
         
