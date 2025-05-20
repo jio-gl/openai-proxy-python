@@ -280,23 +280,62 @@ class OpenAIProxy(BaseAPIProxy):
                 if debug_mode:
                     self.logger.debug(f"Attempting to read request body for {request_id}")
                 
-                # Get the request body
-                body_bytes = await request.body()
-                if debug_mode:
-                    self.logger.debug(f"Successfully read request body: {len(body_bytes)} bytes")
+                # Get the request body with retries in case of issues
+                # FastAPI should cache the body, but let's be extra careful in debug mode
+                max_retries = 3 if debug_mode else 1
+                body_bytes = None
+                retry_count = 0
+                last_error = None
+                
+                # Try to read the body multiple times if needed
+                while retry_count < max_retries and not body_bytes:
+                    try:
+                        # Attempt to read the body
+                        body_bytes = await request.body()
+                        if debug_mode:
+                            self.logger.debug(f"Successfully read request body: {len(body_bytes)} bytes on try {retry_count+1}")
+                    except Exception as e:
+                        last_error = e
+                        retry_count += 1
+                        if debug_mode:
+                            self.logger.debug(f"Retry {retry_count}/{max_retries} reading body: {str(e)}")
+                        # Wait a bit before retrying
+                        await asyncio.sleep(0.1)
+                
+                # If we still couldn't read the body after retries
+                if not body_bytes and last_error:
+                    raise last_error
+                
+                # If body is empty and it's a required method, that's an error
+                if not body_bytes:
+                    self.logger.error(f"Empty request body for {method} request")
+                    self.request_logger.log_request(request_id, method, path, headers, {})
+                    return SafeJSONResponse(
+                        status_code=400,
+                        content={"error": {"message": "Empty request body", "type": "invalid_request_error"}}
+                    )
                     
                 # Parse the JSON
                 body = json.loads(body_bytes)
                 self.request_logger.log_request(request_id, method, path, headers, body)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Error parsing request body JSON: {str(e)}")
+                if debug_mode:
+                    self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
+                self.request_logger.log_request(request_id, method, path, headers, {})
+                return SafeJSONResponse(
+                    status_code=400,
+                    content={"error": {"message": f"Invalid JSON in request body: {str(e)}", "type": "invalid_request_error"}}
+                )
             except Exception as e:
-                self.logger.error(f"Error parsing request body: {str(e)}")
+                self.logger.error(f"Error reading request body: {str(e)}")
                 if debug_mode:
                     self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
                 empty_body = {}
                 self.request_logger.log_request(request_id, method, path, headers, empty_body)
                 return SafeJSONResponse(
                     status_code=400,
-                    content={"error": {"message": f"Invalid request body: {str(e)}", "type": "invalid_request_error"}}
+                    content={"error": {"message": f"Error processing request body: {str(e)}", "type": "invalid_request_error"}}
                 )
         else:
             body = {}
@@ -335,9 +374,14 @@ class OpenAIProxy(BaseAPIProxy):
             if debug_mode:
                 self.logger.debug(f"Creating HTTP client for request to {target_url}")
                 
+            # Adjust timeout based on debug mode - shorter for tests, longer for real usage
+            timeout_seconds = 60.0 if debug_mode else 300.0
+            if debug_mode:
+                self.logger.debug(f"Using timeout of {timeout_seconds} seconds for debug mode")
+                
             # Simplify the client configuration for reliability
             async with httpx.AsyncClient(
-                timeout=300.0,  # 5 minute timeout
+                timeout=timeout_seconds,  # Shorter timeout in debug mode
                 verify=True,    # Use system certificates for verification
                 follow_redirects=True,
                 headers=headers,
@@ -405,12 +449,17 @@ class OpenAIProxy(BaseAPIProxy):
             if debug_mode:
                 self.logger.debug(f"Detailed error: {type(e).__name__}: {str(e)}")
                 
+            # Find and update the fallback HTTP client section in OpenAIProxy
             # Fallback to HTTP/1.1 if HTTP/2 fails
             try:
                 if debug_mode:
                     self.logger.debug("Falling back to HTTP/1.1")
+                
+                # Use the same timeout as the first attempt
+                timeout_seconds = 60.0 if debug_mode else 300.0
+                
                 async with httpx.AsyncClient(
-                    timeout=300.0,
+                    timeout=timeout_seconds,
                     verify=True,
                     trust_env=True,
                     follow_redirects=True,
@@ -456,8 +505,10 @@ class OpenAIProxy(BaseAPIProxy):
                             "Access-Control-Expose-Headers": "*"
                         })
                         return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                    except:
+                    except Exception as json_error:
                         # Just return the raw response content with the modified headers
+                        if debug_mode:
+                            self.logger.debug(f"Non-JSON fallback response: {str(json_error)}")
                         self.request_logger.log_response(
                             request_id, 
                             status_code, 
@@ -688,23 +739,62 @@ class AnthropicProxy(BaseAPIProxy):
                 if debug_mode:
                     self.logger.debug(f"Attempting to read Anthropic request body for {request_id}")
                 
-                # Get the request body
-                body_bytes = await request.body()
-                if debug_mode:
-                    self.logger.debug(f"Successfully read Anthropic request body: {len(body_bytes)} bytes")
+                # Get the request body with retries in case of issues
+                # FastAPI should cache the body, but let's be extra careful in debug mode
+                max_retries = 3 if debug_mode else 1
+                body_bytes = None
+                retry_count = 0
+                last_error = None
+                
+                # Try to read the body multiple times if needed
+                while retry_count < max_retries and not body_bytes:
+                    try:
+                        # Attempt to read the body
+                        body_bytes = await request.body()
+                        if debug_mode:
+                            self.logger.debug(f"Successfully read Anthropic request body: {len(body_bytes)} bytes on try {retry_count+1}")
+                    except Exception as e:
+                        last_error = e
+                        retry_count += 1
+                        if debug_mode:
+                            self.logger.debug(f"Retry {retry_count}/{max_retries} reading body: {str(e)}")
+                        # Wait a bit before retrying
+                        await asyncio.sleep(0.1)
+                
+                # If we still couldn't read the body after retries
+                if not body_bytes and last_error:
+                    raise last_error
+                
+                # If body is empty and it's a required method, that's an error
+                if not body_bytes:
+                    self.logger.error(f"Empty request body for {method} request")
+                    self.request_logger.log_request(request_id, method, path, headers, {})
+                    return SafeJSONResponse(
+                        status_code=400,
+                        content={"error": {"message": "Empty request body", "type": "invalid_request_error"}}
+                    )
                     
                 # Parse the JSON
                 body = json.loads(body_bytes)
                 self.request_logger.log_request(request_id, method, path, headers, body)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Error parsing request body JSON: {str(e)}")
+                if debug_mode:
+                    self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
+                self.request_logger.log_request(request_id, method, path, headers, {})
+                return SafeJSONResponse(
+                    status_code=400,
+                    content={"error": {"message": f"Invalid JSON in request body: {str(e)}", "type": "invalid_request_error"}}
+                )
             except Exception as e:
-                self.logger.error(f"Error parsing request body: {str(e)}")
+                self.logger.error(f"Error reading request body: {str(e)}")
                 if debug_mode:
                     self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
                 empty_body = {}
                 self.request_logger.log_request(request_id, method, path, headers, empty_body)
                 return SafeJSONResponse(
                     status_code=400,
-                    content={"error": {"message": f"Invalid request body: {str(e)}", "type": "invalid_request_error"}}
+                    content={"error": {"message": f"Error processing request body: {str(e)}", "type": "invalid_request_error"}}
                 )
         else:
             body = {}
@@ -757,9 +847,14 @@ class AnthropicProxy(BaseAPIProxy):
             if debug_mode:
                 self.logger.debug(f"Creating HTTP client for Anthropic request to {target_url}")
                 
+            # Adjust timeout based on debug mode - shorter for tests, longer for real usage
+            timeout_seconds = 60.0 if debug_mode else 300.0
+            if debug_mode:
+                self.logger.debug(f"Using timeout of {timeout_seconds} seconds for debug mode")
+                
             # Simplify the client configuration for reliability
             async with httpx.AsyncClient(
-                timeout=300.0,  # 5 minute timeout
+                timeout=timeout_seconds,  # Shorter timeout in debug mode
                 verify=True,    # Use system certificates for verification
                 follow_redirects=True,
                 headers=headers,
@@ -843,12 +938,17 @@ class AnthropicProxy(BaseAPIProxy):
             if debug_mode:
                 self.logger.debug(f"Detailed error: {type(e).__name__}: {str(e)}")
                 
+            # Find and update the fallback HTTP client section in OpenAIProxy
             # Fallback to HTTP/1.1 if HTTP/2 fails
             try:
                 if debug_mode:
-                    self.logger.debug("Falling back to HTTP/1.1 for Anthropic")
+                    self.logger.debug("Falling back to HTTP/1.1")
+                
+                # Use the same timeout as the first attempt
+                timeout_seconds = 60.0 if debug_mode else 300.0
+                
                 async with httpx.AsyncClient(
-                    timeout=300.0,
+                    timeout=timeout_seconds,
                     verify=True,
                     trust_env=True,
                     follow_redirects=True,
@@ -856,11 +956,11 @@ class AnthropicProxy(BaseAPIProxy):
                     cookies={},
                     http2=False,  # Fallback to HTTP/1.1
                 ) as client:
-                    if body and body.get("stream", False):
+                    if is_streaming:
                         return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
                     
                     if debug_mode:
-                        self.logger.debug(f"Sending fallback request to Anthropic: {target_url}")
+                        self.logger.debug(f"Sending fallback request to: {target_url}")
                         
                     response = await client.request(
                         method=method,
@@ -875,7 +975,7 @@ class AnthropicProxy(BaseAPIProxy):
                     response_headers = dict(response.headers)
                     
                     if debug_mode:
-                        self.logger.debug(f"Fallback Anthropic response received: status={status_code}")
+                        self.logger.debug(f"Fallback response received: status={status_code}")
                     
                     # Remove content-encoding to prevent decoding issues
                     if "content-encoding" in response_headers:
@@ -884,8 +984,6 @@ class AnthropicProxy(BaseAPIProxy):
                     # Pass through binary response by default
                     try:
                         response_body = response.json()
-                        if debug_mode:
-                            self.logger.debug(f"Fallback Anthropic response body: {json.dumps(response_body)}")
                         self.request_logger.log_response(request_id, status_code, response_headers, response_body)
                         # Add CORS and private network headers
                         response_headers.update({
@@ -899,7 +997,7 @@ class AnthropicProxy(BaseAPIProxy):
                     except Exception as json_error:
                         # Just return the raw response content with the modified headers
                         if debug_mode:
-                            self.logger.debug(f"Non-JSON fallback Anthropic response: {str(json_error)}")
+                            self.logger.debug(f"Non-JSON fallback response: {str(json_error)}")
                         self.request_logger.log_response(
                             request_id, 
                             status_code, 
