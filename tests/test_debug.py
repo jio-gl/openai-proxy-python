@@ -3,7 +3,7 @@ import json
 import sys
 import time
 
-def test_proxy(port=8001):
+def test_proxy(port=8000):
     """Test the OpenAI proxy with a simple request"""
     url = f"http://localhost:{port}/v1/chat/completions"
     headers = {
@@ -47,7 +47,7 @@ if __name__ == "__main__":
     time.sleep(1)
     
     # Get port from command line if provided
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8001
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     test_proxy(port)
     
     # Clean up the background process if running in the same terminal

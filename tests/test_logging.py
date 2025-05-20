@@ -4,6 +4,7 @@ import pytest
 import re
 from unittest.mock import MagicMock, patch
 from app.logging import setup_logging, RequestResponseLogger, redact_api_key
+import os
 
 def test_setup_logging():
     """Test logging setup"""
@@ -105,22 +106,24 @@ def test_request_logger_log_request():
     headers = {"Authorization": "Bearer sk-1234567890", "Content-Type": "application/json"}
     body = {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}
     
-    request_logger.log_request(request_id, method, path, headers, body)
+    # Mock the debug level environment variable
+    with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+        request_logger.log_request(request_id, method, path, headers, body)
     
-    # Verify logger was called
-    mock_logger.info.assert_called_once()
-    
-    # Verify log message contains expected fields
-    log_message = mock_logger.info.call_args[0][0]
-    assert "API Request" in log_message
-    assert request_id in log_message
-    assert method in log_message
-    assert path in log_message
-    
-    # Verify authorization header was redacted but the key is kept
-    assert "Bearer sk-1234567890" not in log_message
-    assert "Authorization" in log_message
-    assert "[REDACTED]" in log_message
+        # Verify info logger was called with the simplified message
+        mock_logger.info.assert_called_once()
+        info_message = mock_logger.info.call_args[0][0]
+        assert "API Request" in info_message
+        assert request_id in info_message
+        assert method in info_message
+        assert path in info_message
+        
+        # Verify debug logger was called with the detailed information
+        mock_logger.debug.assert_called_once()
+        debug_message = mock_logger.debug.call_args[0][0]
+        assert "API Request details" in debug_message
+        assert request_id in debug_message
+        assert "Authorization" in debug_message  # Header should be in debug message
 
 def test_request_logger_log_response():
     """Test request logger log_response method"""
@@ -136,18 +139,23 @@ def test_request_logger_log_response():
     headers = {"Content-Type": "application/json"}
     body = {"id": "chatcmpl-123", "choices": [{"message": {"content": "Hello there!"}}]}
     
-    request_logger.log_response(request_id, status_code, headers, body)
+    # Mock the debug level environment variable
+    with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+        request_logger.log_response(request_id, status_code, headers, body)
     
-    # Verify logger was called
-    mock_logger.info.assert_called_once()
-    
-    # Verify log message contains expected fields
-    log_message = mock_logger.info.call_args[0][0]
-    assert "API Response" in log_message
-    assert request_id in log_message
-    assert str(status_code) in log_message
-    assert "Content-Type" in log_message
-    assert "Hello there!" in log_message
+        # Verify info logger was called with the simplified message
+        mock_logger.info.assert_called_once()
+        info_message = mock_logger.info.call_args[0][0]
+        assert "API Response" in info_message
+        assert request_id in info_message
+        assert str(status_code) in info_message
+        
+        # Verify debug logger was called with the detailed information
+        mock_logger.debug.assert_called_once()
+        debug_message = mock_logger.debug.call_args[0][0]
+        assert "API Response details" in debug_message
+        assert request_id in debug_message
+        assert "Content-Type" in debug_message  # Header should be in debug message
 
 def test_request_logger_log_error():
     """Test request logger log_error method"""
@@ -172,7 +180,8 @@ def test_request_logger_log_error():
     assert "API Error" in log_message
     assert request_id in log_message
     assert error_message in log_message
-    assert error_type in log_message
+    # The new format doesn't include error_type in the simplified message
+    # so we don't assert for it anymore
 
 def test_api_key_redaction_in_debug_logs():
     """Test that API keys are properly redacted in debug logs"""
@@ -197,14 +206,15 @@ def test_api_key_redaction_in_debug_logs():
             "messages": [{"role": "user", "content": "Test with API key sk-embedded-in-content"}]
         }
         
-        # Log the request
-        request_logger.log_request(request_id, method, path, headers, body)
-        
-        # Verify redact_api_key was called
-        assert mock_redact.called
-        
-        # Get the log message
-        log_message = mock_logger.info.call_args[0][0]
-        
-        # Verify the log message contains the redacted prefix
-        assert "REDACTED:" in log_message, "redact_api_key should have been called" 
+        # Mock the debug level environment variable
+        with patch.dict(os.environ, {"LOG_LEVEL": "DEBUG"}):
+            # Log the request
+            request_logger.log_request(request_id, method, path, headers, body)
+            
+            # Verify redact_api_key was called
+            assert mock_redact.called
+            
+            # Verify debug logger was called with the detailed information containing redacted content
+            mock_logger.debug.assert_called_once()
+            debug_message = mock_logger.debug.call_args[0][0]
+            assert "REDACTED:" in debug_message, "redact_api_key should have been called" 

@@ -47,7 +47,7 @@ class BaseAPIProxy:
         # Check if we're in mock mode
         self.mock_mode = os.environ.get("MOCK_RESPONSES", "false").lower() == "true"
     
-    async def forward_request(self, request: Request, path: str):
+    async def forward_request(self, request: Request, path: str, request_id: str = None):
         """Forward request to API"""
         raise NotImplementedError("Subclasses must implement this method")
     
@@ -175,22 +175,19 @@ class OpenAIProxy(BaseAPIProxy):
             "open-api.ringcredible.com",
         ]
     
-    async def forward_request(self, request: Request, path: str):
+    async def forward_request(self, request: Request, path: str, request_id: str = None):
         """Forward request to OpenAI API"""
         # Generate request ID
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         
         # Remove leading v1/ if present, since base_url already includes /v1
         if path.startswith('v1/'):
             path = path[3:]
             
-        # Use a randomized approach for domains to avoid pattern detection
-        # Sometimes we'll use direct URL, sometimes third-party domains
-        
         # Always use the real OpenAI domain for reliability
         target_host = "api.openai.com"
         target_url = f"https://{target_host}/v1/{path.lstrip('/')}"
-        self.logger.info(f"Target URL: {target_url}")
+        self.logger.info(f"OpenAI request {request_id}: {request.method} {path} -> {target_url}")
         
         # Get request data
         method = request.method
@@ -647,28 +644,29 @@ class AnthropicProxy(BaseAPIProxy):
         self.base_url = settings.anthropic_base_url
         self.headers = settings.get_anthropic_headers()
     
-    async def forward_request(self, request: Request, path: str):
+    async def forward_request(self, request: Request, path: str, request_id: str = None):
         """Forward request to Anthropic API"""
         # Generate request ID
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         
         # Get request method
         method = request.method
         
+        # Build the target URL
+        target_url = f"{self.base_url}/{path.lstrip('/')}"
+        self.logger.info(f"Anthropic request {request_id}: {method} {path} -> {target_url}")
+        
+        # Extract headers from the original request
+        orig_headers = dict(request.headers)
+        
         # Check if we're in debug mode
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
-        
-        # Build target URL - Anthropic has no v1 in base URL unlike OpenAI
-        target_url = f"{self.settings.anthropic_base_url}/{path.lstrip('/')}"
         
         # For OpenAI compatibility - intercept chat/completions
         if path == "chat/completions" or path == "v1/chat/completions":
             self.logger.info("Redirecting to Anthropic API: https://api.anthropic.com/v1/messages")
             # Client is using OpenAI format but targeting Anthropic
             target_url = "https://api.anthropic.com/v1/messages"
-        
-        # Get original headers
-        orig_headers = dict(request.headers)
         
         # Log debug information about auth header presence
         if debug_mode:

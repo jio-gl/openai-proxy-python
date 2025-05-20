@@ -45,7 +45,12 @@ app = FastAPI(
 # Custom logging middleware using proper base class
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID", "unknown")
+        # Generate a proper request ID if not provided
+        request_id = request.headers.get("X-Request-ID", f"req_{socket.gethostname()}_{id(request)}")
+        
+        # Add the request ID to the request state for later retrieval
+        request.state.request_id = request_id
+        
         logger.info(f"Request {request_id}: {request.method} {request.url.path}")
         
         # In debug mode, log more details of the request
@@ -156,7 +161,9 @@ async def openai_proxy_endpoint(request: Request, path: str):
         )
     
     try:
-        return await openai_proxy.forward_request(request, path)
+        # Pass the request_id from middleware to the proxy
+        request_id = getattr(request.state, "request_id", f"req_{id(request)}")
+        return await openai_proxy.forward_request(request, path, request_id)
     except Exception as e:
         error_message = str(e)
         # Redact any API keys that might be in error messages
@@ -186,7 +193,9 @@ async def anthropic_proxy_endpoint(request: Request, path: str):
         )
     
     try:
-        return await anthropic_proxy.forward_request(request, path)
+        # Pass the request_id from middleware to the proxy
+        request_id = getattr(request.state, "request_id", f"req_{id(request)}")
+        return await anthropic_proxy.forward_request(request, path, request_id)
     except Exception as e:
         error_message = str(e)
         # Redact any API keys that might be in error messages

@@ -193,7 +193,7 @@ If you cannot connect to the proxy:
 1. Verify the server is running (`python run.py`)
 2. Check if the port is already in use (`lsof -i :8000`)
 3. Ensure your client is configured to use the correct URL
-4. If using a custom port, update your client URL to match (e.g., `http://localhost:8001/v1`)
+4. If using a custom port, update your client URL to match (e.g., `http://localhost:8000/v1`)
 
 ### Rate Limiting or Timeout Errors
 

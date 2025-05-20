@@ -90,13 +90,17 @@ class RequestResponseLogger:
                 log_message = json.dumps(log_data)
                 # Final redaction pass on the entire message
                 log_message = redact_api_key(log_message)
-                self.logger.info(f"API Request: {log_message}")
+                self.logger.info(f"API Request {request_id}: {method} {path}")
+                
+                # Log details only in debug mode
+                if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG":
+                    self.logger.debug(f"API Request details {request_id}: {log_message}")
             except Exception as e:
                 # Fallback logging if JSON conversion fails
-                self.logger.info(f"API Request: {method} {path} (Error logging full details: {str(e)})")
+                self.logger.info(f"API Request {request_id}: {method} {path} (Error logging full details: {str(e)})")
         except Exception as log_error:
             # Absolute fallback for any error during logging
-            self.logger.error(f"Error logging request: {str(log_error)}")
+            self.logger.error(f"Error logging request {request_id}: {str(log_error)}")
     
     def log_response(self, request_id, status_code, headers, body=None):
         """Log API response"""
@@ -134,13 +138,17 @@ class RequestResponseLogger:
                 log_message = json.dumps(log_data)
                 # Final redaction pass on the entire message
                 log_message = redact_api_key(log_message)
-                self.logger.info(f"API Response: {log_message}")
+                self.logger.info(f"API Response {request_id}: Status {status_code}")
+                
+                # Log details only in debug mode
+                if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG":
+                    self.logger.debug(f"API Response details {request_id}: {log_message}")
             except Exception as e:
                 # Fallback logging if JSON conversion fails
-                self.logger.info(f"API Response: {status_code} (Error logging full details: {str(e)})")
+                self.logger.info(f"API Response {request_id}: Status {status_code} (Error logging full details: {str(e)})")
         except Exception as log_error:
             # Absolute fallback for any error during logging
-            self.logger.error(f"Error logging response: {str(log_error)}")
+            self.logger.error(f"Error logging response {request_id}: {str(log_error)}")
     
     def log_error(self, request_id, error_message, error_type=None):
         """Log API error"""
@@ -155,7 +163,7 @@ class RequestResponseLogger:
         }
         
         log_message = json.dumps(log_data)
-        self.logger.error(f"API Error: {log_message}")
+        self.logger.error(f"API Error {request_id}: {error_message}")
     
     def _sanitize_headers(self, headers):
         """Sanitize sensitive headers"""
