@@ -104,18 +104,18 @@ def test_streaming_chat_completion_integration(client):
     # Due to Brotli decompression issues in the test client, we'll just check
     # that the endpoint accepts a streaming request and returns a 200 status code
     try:
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "gpt-3.5-turbo",
-            "messages": [{"role": "user", "content": "Count from 1 to 5"}],
-            "temperature": 0.7,
-            "max_tokens": 50,
-            "stream": True
-            },
-            headers={"Accept": "text/event-stream"}
-    )
-    assert response.status_code == 200
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-3.5-turbo",
+                "messages": [{"role": "user", "content": "Count from 1 to 5"}],
+                "temperature": 0.7,
+                "max_tokens": 50,
+                "stream": True
+                },
+                headers={"Accept": "text/event-stream"}
+        )
+        assert response.status_code == 200
     except httpx.DecodingError:
         # If we encounter the Brotli decompression error, just pass the test
         # This error happens in the test client but not in real-world usage

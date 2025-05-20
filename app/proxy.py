@@ -291,63 +291,52 @@ class OpenAIProxy(BaseAPIProxy):
                 follow_redirects=True,
                 headers=headers,
             ) as client:
-                    # Handle regular responses - pass full URL directly
-                    self.logger.info(f"Sending request to: {target_url}")
-                    response = await client.request(
-                        method=method,
-                        url=target_url,  # Use full target URL to ensure proper SNI
-                        headers=headers,
+                # Handle regular responses - pass full URL directly
+                self.logger.info(f"Sending request to: {target_url}")
+                response = await client.request(
+                    method=method,
+                    url=target_url,  # Use full target URL to ensure proper SNI
+                    headers=headers,
                     json=body if method in ("POST", "PUT", "PATCH") else None,
-                        params=request.query_params,
+                    params=request.query_params,
+                )
+                
+                # Get response data
+                status_code = response.status_code
+                response_headers = dict(response.headers)
+                
+                # Remove content-encoding to prevent decoding issues
+                if "content-encoding" in response_headers:
+                    del response_headers["content-encoding"]
+                
+                # Pass through binary response by default
+                try:
+                    response_body = response.json()
+                    self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                    # Add CORS and private network headers
+                    response_headers.update({
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                        "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                        "Access-Control-Allow-Private-Network": "true",
+                        "Access-Control-Expose-Headers": "*"
+                    })
+                    return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+                except:
+                    # Just return the raw response content with the modified headers
+                    self.request_logger.log_response(
+                        request_id, 
+                        status_code, 
+                        response_headers, 
+                        {"binary": True, "length": len(response.content)}
                     )
-                    
-                    # Get response data
-                    status_code = response.status_code
-                    response_headers = dict(response.headers)
-                    
-                    # Remove content-encoding to prevent decoding issues
-                    if "content-encoding" in response_headers:
-                        del response_headers["content-encoding"]
-                    
-                    # Pass through binary response by default
-                    try:
-                        # Try to parse as JSON first (response.json() will handle any decoding)
-                        try:
-                            response_body = response.json()
-                            self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                        # Add CORS and private network headers
-                        response_headers.update({
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                            "Access-Control-Allow-Private-Network": "true",
-                            "Access-Control-Expose-Headers": "*"
-                        })
-                            return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                        except:
-                            # Just return the raw response content with the modified headers
-                            self.request_logger.log_response(
-                                request_id, 
-                                status_code, 
-                                response_headers, 
-                                {"binary": True, "length": len(response.content)}
-                            )
-                            # Ensure Content-Length is set correctly
-                            response_headers["content-length"] = str(len(response.content))
-                            return Response(
-                                content=response.content,
-                                status_code=status_code, 
-                                headers=response_headers,
-                                media_type=response_headers.get("content-type", "application/json")
-                        )
-                except Exception as e:
-                    self.logger.error(f"Error making request to OpenAI API: {str(e)}")
-                    error_content = {"error": {"message": f"Error communicating with OpenAI API: {str(e)}", "type": "proxy_error"}}
-                    error_json = json.dumps(error_content).encode('utf-8')
-                    return SafeJSONResponse(
-                        status_code=500,
-                        content=error_content,
-                        headers={"Content-Length": str(len(error_json))}
+                    # Ensure Content-Length is set correctly
+                    response_headers["content-length"] = str(len(response.content))
+                    return Response(
+                        content=response.content,
+                        status_code=status_code, 
+                        headers=response_headers,
+                        media_type=response_headers.get("content-type", "application/json")
                     )
         except Exception as e:
             self.logger.error(f"Error creating client or making request: {str(e)}")
@@ -383,43 +372,32 @@ class OpenAIProxy(BaseAPIProxy):
                     
                     # Pass through binary response by default
                     try:
-                        # Try to parse as JSON first (response.json() will handle any decoding)
-                        try:
-                            response_body = response.json()
-                            self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                            # Add CORS and private network headers
-                            response_headers.update({
-                                "Access-Control-Allow-Origin": "*",
-                                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                                "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                                "Access-Control-Allow-Private-Network": "true",
-                                "Access-Control-Expose-Headers": "*"
-                            })
-                            return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                        except:
-                            # Just return the raw response content with the modified headers
-                            self.request_logger.log_response(
-                                request_id, 
-                                status_code, 
-                                response_headers, 
-                                {"binary": True, "length": len(response.content)}
-                            )
-                            # Ensure Content-Length is set correctly
-                            response_headers["content-length"] = str(len(response.content))
-                            return Response(
-                                content=response.content,
-                                status_code=status_code, 
-                                headers=response_headers,
-                                media_type=response_headers.get("content-type", "application/json")
-                            )
-                    except Exception as e:
-                        self.logger.error(f"Error making request to OpenAI API: {str(e)}")
-                        error_content = {"error": {"message": f"Error communicating with OpenAI API: {str(e)}", "type": "proxy_error"}}
-                        error_json = json.dumps(error_content).encode('utf-8')
-                        return SafeJSONResponse(
-                            status_code=500,
-                            content=error_content,
-                            headers={"Content-Length": str(len(error_json))}
+                        response_body = response.json()
+                        self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                        # Add CORS and private network headers
+                        response_headers.update({
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                            "Access-Control-Allow-Private-Network": "true",
+                            "Access-Control-Expose-Headers": "*"
+                        })
+                        return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+                    except:
+                        # Just return the raw response content with the modified headers
+                        self.request_logger.log_response(
+                            request_id, 
+                            status_code, 
+                            response_headers, 
+                            {"binary": True, "length": len(response.content)}
+                        )
+                        # Ensure Content-Length is set correctly
+                        response_headers["content-length"] = str(len(response.content))
+                        return Response(
+                            content=response.content,
+                            status_code=status_code, 
+                            headers=response_headers,
+                            media_type=response_headers.get("content-type", "application/json")
                         )
             except Exception as fallback_error:
                 self.logger.error(f"Error in fallback HTTP/1.1 request: {str(fallback_error)}")
@@ -672,17 +650,17 @@ class AnthropicProxy(BaseAPIProxy):
                 self.logger.info(f"Converted OpenAI format to Anthropic format: {body}")
             except Exception as e:
                 self.logger.error(f"Error converting OpenAI format to Anthropic: {str(e)}")
-                    return SafeJSONResponse(
-                        status_code=400,
+                return SafeJSONResponse(
+                    status_code=400,
                     content={"error": {"message": f"Error converting to Anthropic format: {str(e)}", "type": "format_error"}}
-                    )
+                )
                 
         # Security checks
         try:
             self.security_filter.validate_request(body, path)
         except HTTPException as exc:
             self.logger.warning(f"Security violation: {exc.detail}")
-                return SafeJSONResponse(
+            return SafeJSONResponse(
                 status_code=exc.status_code,
                 content={"error": {"message": f"Security violation: {exc.detail}", "type": "security_filter_error"}}
             )
@@ -726,43 +704,32 @@ class AnthropicProxy(BaseAPIProxy):
                     
                     # Pass through binary response by default
                     try:
-                        # Try to parse as JSON first (response.json() will handle any decoding)
-                        try:
-                            response_body = response.json()
-                            self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                            # Add CORS and private network headers
-                            response_headers.update({
-                                "Access-Control-Allow-Origin": "*",
-                                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                                "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                                "Access-Control-Allow-Private-Network": "true",
-                                "Access-Control-Expose-Headers": "*"
-                            })
-                            return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                        except:
-                            # Just return the raw response content with the modified headers
-                            self.request_logger.log_response(
-                                request_id, 
-                                status_code, 
-                                response_headers, 
-                                {"binary": True, "length": len(response.content)}
-                            )
-                            # Ensure Content-Length is set correctly
-                            response_headers["content-length"] = str(len(response.content))
-                            return Response(
-                                content=response.content,
-                                status_code=status_code, 
-                                headers=response_headers,
-                                media_type=response_headers.get("content-type", "application/json")
-                            )
-                    except Exception as e:
-                        self.logger.error(f"Error making request to Anthropic API: {str(e)}")
-                        error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(e)}", "type": "proxy_error"}}
-                        error_json = json.dumps(error_content).encode('utf-8')
-                        return SafeJSONResponse(
-                            status_code=500,
-                            content=error_content,
-                            headers={"Content-Length": str(len(error_json))}
+                        response_body = response.json()
+                        self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                        # Add CORS and private network headers
+                        response_headers.update({
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                            "Access-Control-Allow-Private-Network": "true",
+                            "Access-Control-Expose-Headers": "*"
+                        })
+                        return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+                    except:
+                        # Just return the raw response content with the modified headers
+                        self.request_logger.log_response(
+                            request_id, 
+                            status_code, 
+                            response_headers, 
+                            {"binary": True, "length": len(response.content)}
+                        )
+                        # Ensure Content-Length is set correctly
+                        response_headers["content-length"] = str(len(response.content))
+                        return Response(
+                            content=response.content,
+                            status_code=status_code, 
+                            headers=response_headers,
+                            media_type=response_headers.get("content-type", "application/json")
                         )
                 except Exception as e:
                     self.logger.error(f"Error making request to Anthropic API: {str(e)}")
@@ -807,43 +774,32 @@ class AnthropicProxy(BaseAPIProxy):
                     
                     # Pass through binary response by default
                     try:
-                        # Try to parse as JSON first (response.json() will handle any decoding)
-                        try:
-                            response_body = response.json()
-                            self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                            # Add CORS and private network headers
-                            response_headers.update({
-                                "Access-Control-Allow-Origin": "*",
-                                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                                "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                                "Access-Control-Allow-Private-Network": "true",
-                                "Access-Control-Expose-Headers": "*"
-                            })
-                            return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                        except:
-                            # Just return the raw response content with the modified headers
-                            self.request_logger.log_response(
-                                request_id, 
-                                status_code, 
-                                response_headers, 
-                                {"binary": True, "length": len(response.content)}
-                            )
-                            # Ensure Content-Length is set correctly
-                            response_headers["content-length"] = str(len(response.content))
-                            return Response(
-                                content=response.content,
-                                status_code=status_code, 
-                                headers=response_headers,
-                                media_type=response_headers.get("content-type", "application/json")
-                            )
-                    except Exception as e:
-                        self.logger.error(f"Error making request to Anthropic API: {str(e)}")
-                        error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(e)}", "type": "proxy_error"}}
-                        error_json = json.dumps(error_content).encode('utf-8')
-                        return SafeJSONResponse(
-                            status_code=500,
-                            content=error_content,
-                            headers={"Content-Length": str(len(error_json))}
+                        response_body = response.json()
+                        self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                        # Add CORS and private network headers
+                        response_headers.update({
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                            "Access-Control-Allow-Private-Network": "true",
+                            "Access-Control-Expose-Headers": "*"
+                        })
+                        return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+                    except:
+                        # Just return the raw response content with the modified headers
+                        self.request_logger.log_response(
+                            request_id, 
+                            status_code, 
+                            response_headers, 
+                            {"binary": True, "length": len(response.content)}
+                        )
+                        # Ensure Content-Length is set correctly
+                        response_headers["content-length"] = str(len(response.content))
+                        return Response(
+                            content=response.content,
+                            status_code=status_code, 
+                            headers=response_headers,
+                            media_type=response_headers.get("content-type", "application/json")
                         )
             except Exception as fallback_error:
                 self.logger.error(f"Error in fallback HTTP/1.1 request: {str(fallback_error)}")

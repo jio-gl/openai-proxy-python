@@ -53,7 +53,7 @@ def test_openai_streaming():
         # Don't fail the test due to compression issues
         if "BrotliDecoderDecompressStream" in str(e):
             print("Brotli decompression error - this is expected in tests")
-                            pass
+            pass
         else:
             # For other errors, fail the test
             raise
