@@ -43,7 +43,30 @@ class BaseAPIProxy:
         self.logger = logging.getLogger("api-firewall")
         self.request_logger = RequestResponseLogger(self.logger)
         self.security_filter = SecurityFilter(settings)
-        self.client = httpx.AsyncClient(timeout=60.0)
+        
+        # Create a persistent client with cookie handling and proper session management
+        self.client = httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+            verify=True,
+            cookies=httpx.Cookies(),  # Add cookie jar
+            http2=True  # Enable HTTP/2 by default
+        )
+        
+        # Create a separate streaming client with longer timeout and cookie handling
+        self.streaming_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10.0,    # Connection timeout
+                read=None,      # No read timeout for streaming
+                write=None,     # No write timeout for streaming
+                pool=None      # No pool timeout
+            ),
+            follow_redirects=True,
+            verify=True,
+            cookies=httpx.Cookies(),  # Separate cookie jar for streaming
+            http2=True  # Enable HTTP/2 by default
+        )
+        
         # Check if we're in mock mode
         self.mock_mode = os.environ.get("MOCK_RESPONSES", "false").lower() == "true"
     
@@ -59,43 +82,45 @@ class BaseAPIProxy:
         """Handle streaming responses from API"""
         self.logger.info(f"Handling streaming request {request_id} to {url}")
         
-        # Check if we're in debug mode to adjust timeouts
-        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+        # Create a copy of headers that's safe to modify
+        stream_headers = headers.copy()
         
-        # Use longer timeout for streaming to prevent truncation
-        timeout_seconds = 150.0 if debug_mode else 600.0
+        # Ensure proper streaming headers
+        stream_headers.update({
+            "Connection": "keep-alive",
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Transfer-Encoding": "chunked"
+        })
+        
+        # Remove any content-length header as it interferes with chunked encoding
+        stream_headers.pop("content-length", None)
         
         async def stream_generator():
-            # Use a fresh client for streaming
-            stream_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout_seconds),
-                verify=True
-            )
-            
-            # Create a copy of headers that's safe to modify
-            stream_headers = headers.copy()
-            
-            # Ensure any content-length header is removed for streaming requests
-            if 'content-length' in stream_headers:
-                del stream_headers['content-length']
-            
             try:
-                # Make the streaming request
-                self.logger.info(f"Sending streaming request to: {url}")
-                if debug_mode:
-                    self.logger.debug(f"Using streaming timeout of {timeout_seconds} seconds in debug mode")
-                    
-                async with stream_client.stream(
+                # Use the persistent streaming client
+                async with self.streaming_client.stream(
                     method=method,
                     url=url,
                     headers=stream_headers,
-                    json=body
+                    json=body,
+                    timeout=None  # Use client's timeout settings
                 ) as response:
-                    response_headers = dict(response.headers)
+                    # Copy cookies from response to our cookie jar
+                    if "set-cookie" in response.headers:
+                        self.streaming_client.cookies.extract_cookies(response)
                     
-                    # Remove content-length from response headers to prevent mismatch
-                    if 'content-length' in response_headers:
-                        del response_headers['content-length']
+                    response_headers = dict(response.headers)
+                    response_headers.pop("content-length", None)  # Remove content-length
+                    
+                    # Copy any new cookies to the main client's cookie jar
+                    for cookie in self.streaming_client.cookies.jar:
+                        self.client.cookies.set(
+                            cookie.name,
+                            cookie.value,
+                            domain=cookie.domain,
+                            path=cookie.path
+                        )
                     
                     self.request_logger.log_response(
                         request_id, 
@@ -104,28 +129,25 @@ class BaseAPIProxy:
                         {"streaming": True}
                     )
                     
-                    # Stream the bytes directly without any artificial limits
+                    # Stream chunks with proper error handling
                     async for chunk in response.aiter_bytes():
-                        yield chunk
+                        if chunk:  # Only yield non-empty chunks
+                            yield chunk
+                    
+                    # Ensure proper stream termination
+                    yield b"data: [DONE]\n\n"
                             
             except httpx.TimeoutException as e:
                 self.logger.error(f"Timeout in streaming response: {str(e)}")
-                error_msg = json.dumps({"error": {"message": "Stream timed out", "type": "timeout_error"}})
-                yield f"data: {error_msg}\n\n".encode("utf-8")
-                yield f"data: [DONE]\n\n".encode("utf-8")
-                            
+                yield f"data: {json.dumps({'error': {'message': 'Stream timed out', 'type': 'timeout_error'}})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                
             except Exception as e:
                 self.logger.error(f"Error in streaming response: {str(e)}")
-                # Return error message in SSE format
-                error_msg = json.dumps({"error": {"message": str(e), "type": "stream_error"}})
-                yield f"data: {error_msg}\n\n".encode("utf-8")
-                yield f"data: [DONE]\n\n".encode("utf-8")
-            
-            finally:
-                # Ensure the client is closed properly
-                await stream_client.aclose()
+                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'stream_error'}})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
         
-        # Get response content type and essential headers for streaming
+        # Set response headers for streaming
         response_headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -135,17 +157,24 @@ class BaseAPIProxy:
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
             "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
             "Access-Control-Allow-Private-Network": "true",
-            "Access-Control-Expose-Headers": "*"
+            "Access-Control-Expose-Headers": "*",
+            "X-Accel-Buffering": "no"  # Disable proxy buffering
         }
-        
-        # Important: Do not set Content-Length for streaming responses
-        # This is crucial to avoid the "Too much data for declared Content-Length" error
         
         return StreamingResponse(
             stream_generator(),
             media_type="text/event-stream",
             headers=response_headers
         )
+
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - cleanup clients"""
+        await self.client.aclose()
+        await self.streaming_client.aclose()
 
 class OpenAIProxy(BaseAPIProxy):
     """Proxy for OpenAI API requests"""
@@ -198,13 +227,22 @@ class OpenAIProxy(BaseAPIProxy):
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0"
         ]
         
+        # Extract cookies from request if present
+        request_cookies = request.cookies
+        if request_cookies:
+            # Update the client's cookie jar with request cookies
+            for name, value in request_cookies.items():
+                self.client.cookies.set(name, value, domain=target_host)
+                self.streaming_client.cookies.set(name, value, domain=target_host)
+
         # Create completely browser-like headers
         headers = {
             "Authorization": orig_headers.get("Authorization", self.headers.get("Authorization")),
             "Content-Type": "application/json",
             "User-Agent": random.choice(browser_agents),
-            "Accept": "application/json",
+            "Accept": orig_headers.get("accept", "application/json"),
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
             "Referer": "https://platform.openai.com/",
             "Origin": "https://platform.openai.com",
             "Host": target_host,
@@ -220,6 +258,15 @@ class OpenAIProxy(BaseAPIProxy):
             "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
             "Access-Control-Allow-Private-Network": "true"
         }
+        
+        # For streaming requests, ensure proper headers
+        if orig_headers.get("accept") == "text/event-stream":
+            headers.update({
+                "Accept": "text/event-stream",
+                "Connection": "keep-alive",
+                "Cache-Control": "no-cache",
+                "Transfer-Encoding": "chunked"
+            })
         
         # Handle organization correctly - get from request first, or use from settings
         client_org_id = orig_headers.get("OpenAI-Organization", "")
@@ -238,14 +285,6 @@ class OpenAIProxy(BaseAPIProxy):
         # Add random request ID to simulate genuine traffic
         if random.random() > 0.5:  # 50% chance to include
             headers["X-Request-ID"] = str(uuid.uuid4())
-            
-        # Use Accept header from the original request if present
-        if "accept" in orig_headers:
-            headers["Accept"] = orig_headers["accept"]
-            
-        # For streaming requests from clients, ensure proper headers
-        if "accept" in orig_headers and orig_headers["accept"] == "text/event-stream":
-            headers["Accept"] = "text/event-stream"
             
         # Log outgoing headers for debugging
         self.logger.info(f"Outgoing headers to OpenAI: {headers}")
