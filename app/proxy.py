@@ -9,6 +9,7 @@ import copy
 from fastapi import Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.background import BackgroundTask
+import urllib.parse
 
 from app.config import Settings
 from app.logging import RequestResponseLogger, redact_api_key
@@ -126,7 +127,7 @@ class BaseAPIProxy:
         
         if debug_mode:
             self.logger.debug(f"Handling streaming request to {target_url}")
-            # Log streaming request body
+            # Log streaming request body and cookies
             if body:
                 try:
                     sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
@@ -138,8 +139,12 @@ class BaseAPIProxy:
                     body_json = json.dumps(sanitized_body)
                     body_json = redact_api_key(body_json)
                     self.logger.debug(f"Streaming request body {request_id}: {body_json}")
+                    
+                    # Log current cookies
+                    cookies_str = '; '.join([f"{c.name}={c.value}" for c in client.cookies.jar])
+                    self.logger.debug(f"Current cookies for request {request_id}: {cookies_str}")
                 except Exception as e:
-                    self.logger.debug(f"Could not log streaming request body {request_id}: {str(e)}")
+                    self.logger.debug(f"Could not log streaming request details {request_id}: {str(e)}")
         
         # Create a copy of headers that's safe to modify
         stream_headers = headers.copy()
@@ -155,6 +160,9 @@ class BaseAPIProxy:
         # Remove any content-length header as it interferes with chunked encoding
         stream_headers.pop("content-length", None)
         
+        # Extract domain from target URL for cookie handling
+        target_domain = urllib.parse.urlparse(target_url).netloc
+        
         try:
             # Make the streaming request with proper timeout settings
             async with client.stream(
@@ -169,6 +177,15 @@ class BaseAPIProxy:
                     pool=None        # No pool timeout
                 )
             ) as response:
+                # Extract and update cookies from response
+                if "set-cookie" in response.headers:
+                    self.logger.debug(f"Found Set-Cookie header in streaming response {request_id}")
+                    client.cookies.extract_cookies(response)
+                    
+                    if debug_mode:
+                        cookies_str = '; '.join([f"{c.name}={c.value}" for c in client.cookies.jar])
+                        self.logger.debug(f"Updated cookies after streaming response {request_id}: {cookies_str}")
+                
                 # Create the streaming response with proper headers
                 response_headers = {
                     "Content-Type": "text/event-stream",
@@ -180,9 +197,14 @@ class BaseAPIProxy:
                 
                 # Copy relevant headers from the upstream response
                 for header in ["access-control-allow-origin", "access-control-allow-methods",
-                             "access-control-allow-headers", "access-control-expose-headers"]:
+                             "access-control-allow-headers", "access-control-expose-headers",
+                             "access-control-allow-credentials"]:
                     if header in response.headers:
                         response_headers[header] = response.headers[header]
+                
+                # Copy any Set-Cookie headers
+                if "set-cookie" in response.headers:
+                    response_headers["set-cookie"] = response.headers["set-cookie"]
                 
                 return StreamingResponse(
                     self._process_stream(response, request_id, debug_mode),
@@ -190,7 +212,7 @@ class BaseAPIProxy:
                     headers=response_headers
                 )
         except Exception as e:
-            self.logger.error(f"Error in streaming request: {str(e)}")
+            self.logger.error(f"Error in streaming request {request_id}: {str(e)}")
             error_content = {"error": {"message": str(e), "type": "stream_error"}}
             return JSONResponse(
                 status_code=500,
