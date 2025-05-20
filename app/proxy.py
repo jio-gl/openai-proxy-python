@@ -421,6 +421,20 @@ class OpenAIProxy(BaseAPIProxy):
                 if debug_mode:
                     self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
                 
+                # Extract cookies from response and update our cookie jar
+                if "set-cookie" in response_headers:
+                    self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
+                    self.client.cookies.extract_cookies(response)
+                    
+                    # Share cookies with streaming client for future requests
+                    for cookie in self.client.cookies.jar:
+                        self.streaming_client.cookies.set(
+                            cookie.name, 
+                            cookie.value, 
+                            domain=cookie.domain, 
+                            path=cookie.path
+                        )
+                
                 # Remove content-encoding to prevent decoding issues
                 if "content-encoding" in response_headers:
                     del response_headers["content-encoding"]
@@ -501,6 +515,20 @@ class OpenAIProxy(BaseAPIProxy):
                     
                     if debug_mode:
                         self.logger.debug(f"Fallback response received: status={status_code}")
+                    
+                    # Extract cookies from response and update our cookie jar
+                    if "set-cookie" in response_headers:
+                        self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
+                        self.client.cookies.extract_cookies(response)
+                        
+                        # Share cookies with streaming client for future requests
+                        for cookie in self.client.cookies.jar:
+                            self.streaming_client.cookies.set(
+                                cookie.name, 
+                                cookie.value, 
+                                domain=cookie.domain, 
+                                path=cookie.path
+                            )
                     
                     # Remove content-encoding to prevent decoding issues
                     if "content-encoding" in response_headers:
@@ -886,6 +914,20 @@ class AnthropicProxy(BaseAPIProxy):
                     if debug_mode:
                         self.logger.debug(f"Anthropic response received: status={status_code}, headers={response_headers}")
                     
+                    # Extract cookies from response and update our cookie jar
+                    if "set-cookie" in response_headers:
+                        self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
+                        self.client.cookies.extract_cookies(response)
+                        
+                        # Share cookies with streaming client for future requests
+                        for cookie in self.client.cookies.jar:
+                            self.streaming_client.cookies.set(
+                                cookie.name, 
+                                cookie.value, 
+                                domain=cookie.domain, 
+                                path=cookie.path
+                            )
+                    
                     # Remove content-encoding to prevent decoding issues
                     if "content-encoding" in response_headers:
                         del response_headers["content-encoding"]
@@ -977,6 +1019,20 @@ class AnthropicProxy(BaseAPIProxy):
                     
                     if debug_mode:
                         self.logger.debug(f"Fallback response received: status={status_code}")
+                    
+                    # Extract cookies from response and update our cookie jar
+                    if "set-cookie" in response_headers:
+                        self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
+                        self.client.cookies.extract_cookies(response)
+                        
+                        # Share cookies with streaming client for future requests
+                        for cookie in self.client.cookies.jar:
+                            self.streaming_client.cookies.set(
+                                cookie.name, 
+                                cookie.value, 
+                                domain=cookie.domain, 
+                                path=cookie.path
+                            )
                     
                     # Remove content-encoding to prevent decoding issues
                     if "content-encoding" in response_headers:
