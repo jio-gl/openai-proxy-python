@@ -22,18 +22,16 @@ logger = setup_logging()
 # Load settings
 settings = Settings()
 
-# Debug log to check settings - with masked API key
+# Debug log to check settings - without masking API key
 if settings.openai_api_key:
-    masked_api_key = settings.openai_api_key[:5] + "..." if len(settings.openai_api_key) > 5 else "not set"
-    logger.info(f"OpenAI API Key: {masked_api_key} [masked]")
+    logger.info(f"OpenAI API Key: {settings.openai_api_key}")
 else:
     logger.info("OpenAI API Key: not set")
     
 logger.info(f"OpenAI Base URL: {settings.openai_base_url}")
 
-# Mask organization ID if present
-masked_org_id = settings.openai_org_id[:4] + "..." if settings.openai_org_id and len(settings.openai_org_id) > 4 else settings.openai_org_id
-logger.info(f"OpenAI Organization ID: {masked_org_id}")
+# Log organization ID without masking
+logger.info(f"OpenAI Organization ID: {settings.openai_org_id}")
 
 # Create FastAPI app
 app = FastAPI(
@@ -59,14 +57,8 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         # Only log detailed information in debug mode
         if debug_mode:
             try:
-                # Log sanitized headers
+                # Log full headers without redaction
                 headers_dict = dict(request.headers)
-                # Redact sensitive headers
-                if "authorization" in headers_dict:
-                    headers_dict["authorization"] = "[REDACTED]"
-                if "x-api-key" in headers_dict:
-                    headers_dict["x-api-key"] = "[REDACTED]"
-                
                 logger.debug(f"Request headers {request_id}: {headers_dict}")
                 
                 # For JSON content types, we'll store the body bytes for logging,
@@ -74,13 +66,10 @@ class LoggingMiddleware(BaseHTTPMiddleware):
                 is_json_content = (request.method in ("POST", "PUT", "PATCH") and 
                                   request.headers.get("Content-Type", "").startswith("application/json"))
                 
-                # Store original body for later - don't attempt to read it yet
-                # Pass the original request to downstream
             except Exception as e:
                 logger.debug(f"Error logging request headers: {str(e)}")
         
         # Process the request normally
-        # Important: we don't touch the body before passing to the handler
         response = await call_next(request)
         
         # Log the response
@@ -89,13 +78,8 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         # In debug mode, log response headers
         if debug_mode:
             try:
-                # Redact sensitive headers
+                # Log full response headers without redaction
                 response_headers = dict(response.headers)
-                if "authorization" in response_headers:
-                    response_headers["authorization"] = "[REDACTED]"
-                if "x-api-key" in response_headers:
-                    response_headers["x-api-key"] = "[REDACTED]"
-                
                 logger.debug(f"Response headers {request_id}: {response_headers}")
             except Exception as e:
                 logger.debug(f"Error logging response headers: {str(e)}")

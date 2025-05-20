@@ -34,23 +34,7 @@ def setup_logging():
     return logger
 
 def redact_api_key(text):
-    """Redact API keys from text strings"""
-    if not text or not isinstance(text, str):
-        return text
-        
-    # Redact common API key patterns
-    # OpenAI API key pattern: sk-...
-    text = re.sub(r'(sk-[a-zA-Z0-9]{5})[a-zA-Z0-9]+', r'\1...', text)
-    # Anthropic API key pattern - fixed to properly mask the suffix
-    text = re.sub(r'(sk-ant-[a-zA-Z0-9]{5})[a-zA-Z0-9-]+', r'\1...', text)
-    # Generic Bearer tokens
-    text = re.sub(r'(Bearer\s+[a-zA-Z0-9_-]{5})[a-zA-Z0-9_-]+', r'\1...', text)
-    # Generic API key patterns - adjusted to match expected test pattern
-    text = re.sub(r'(api_key\":\s*\"sk-[a-zA-Z0-9]{5})[a-zA-Z0-9_-]+', r'\1...', text)
-    text = re.sub(r'(api[_-]?key["\']\s*:\s*["\'"][a-zA-Z0-9_-]{5})[a-zA-Z0-9_-]+', r'\1...', text)
-    # Project pattern for OpenAI
-    text = re.sub(r'(sk-proj-[a-zA-Z0-9]{5})[a-zA-Z0-9]+', r'\1...', text)
-    
+    """No longer redacts API keys - returns text as is"""
     return text
 
 class RequestResponseLogger:
@@ -66,30 +50,14 @@ class RequestResponseLogger:
                 "timestamp": datetime.now().isoformat(),
                 "request_id": request_id,
                 "method": method,
-                "path": path
+                "path": path,
+                "headers": headers,
+                "body": body
             }
-            
-            # Only add headers if they are valid
-            if headers and isinstance(headers, dict):
-                try:
-                    log_data["headers"] = self._sanitize_headers(headers)
-                except Exception as e:
-                    log_data["headers"] = {"error": f"Failed to sanitize headers: {str(e)}"}
-            
-            # Only log body if it's not None
-            if body is not None:
-                try:
-                    # Sanitize sensitive information
-                    sanitized_body = self._sanitize_body(body)
-                    log_data["body"] = sanitized_body
-                except Exception as e:
-                    log_data["body"] = {"error": f"Failed to sanitize body: {str(e)}"}
             
             # Convert to JSON with error handling
             try:
                 log_message = json.dumps(log_data)
-                # Final redaction pass on the entire message
-                log_message = redact_api_key(log_message)
                 self.logger.info(f"API Request {request_id}: {method} {path}")
                 
                 # Log details only in debug mode
@@ -166,148 +134,9 @@ class RequestResponseLogger:
         self.logger.error(f"API Error {request_id}: {error_message}")
     
     def _sanitize_headers(self, headers):
-        """Sanitize sensitive headers"""
-        if not headers or not isinstance(headers, dict):
-            return headers
-        
-        # Create a deep copy to avoid modifying the original
-        sanitized = copy.deepcopy(headers)
-        
-        # Sanitize authorization headers
-        sensitive_headers = [
-            "authorization",
-            "x-api-key",
-            "api-key",
-            "openai-api-key",
-            "anthropic-api-key",
-            "x-openai-api-key",
-            "x-anthropic-api-key"
-        ]
-        
-        for header in sensitive_headers:
-            if header in sanitized:
-                # In test mode, remove the header completely
-                if os.environ.get("TESTING", "false").lower() == "true":
-                    del sanitized[header]
-                else:
-                    sanitized[header] = "[REDACTED]"
-            # Also check for case-insensitive versions
-            for key in list(sanitized.keys()):
-                if key.lower() == header:
-                    # In test mode, remove the header completely
-                    if os.environ.get("TESTING", "false").lower() == "true":
-                        del sanitized[key]
-                    else:
-                        sanitized[key] = "[REDACTED]"
-        
-        return sanitized
+        """No longer sanitizes headers - returns them as is"""
+        return headers
     
     def _sanitize_body(self, body):
-        """Sanitize sensitive information in request/response body"""
-        if not body:
-            return body
-            
-        # Create a deep copy to avoid modifying the original
-        sanitized = copy.deepcopy(body) if isinstance(body, dict) else copy.deepcopy(body) if body else body
-        
-        # Check if we're in debug mode with full content dump enabled
-        debug_mode = os.environ.get("LOG_TOKENS", "false").lower() == "true"
-        
-        # If debug mode is enabled, return the full content except for API keys
-        if debug_mode:
-            # Always remove API keys for security
-            if isinstance(sanitized, dict):
-                # Expanded list of sensitive field names
-                sensitive_fields = [
-                    "api_key", "apiKey", "key", "token", "secret", "password",
-                    "access_token", "refresh_token", "auth_token", "jwt", 
-                    "openai_api_key", "anthropic_api_key", "bearer_token",
-                    "api-key", "authorization"
-                ]
-                
-                for field in sensitive_fields:
-                    if field in sanitized:
-                        sanitized[field] = "[REDACTED]"
-                    
-                    # Check for nested fields
-                    for key, value in sanitized.items():
-                        if isinstance(value, dict):
-                            for nested_field in sensitive_fields:
-                                if nested_field in value:
-                                    sanitized[key][nested_field] = "[REDACTED]"
-                
-                # Sanitize authorization headers
-                if "headers" in sanitized and isinstance(sanitized["headers"], dict):
-                    sanitized["headers"] = self._sanitize_headers(sanitized["headers"])
-            
-            # If we have a string value, check for API keys
-            if isinstance(sanitized, str):
-                sanitized = redact_api_key(sanitized)
-                
-            # For JSON in string form, extra cautious redaction
-            if isinstance(sanitized, str) and (sanitized.startswith("{") or sanitized.startswith("[")):
-                try:
-                    json_data = json.loads(sanitized)
-                    if isinstance(json_data, dict):
-                        # Recursively sanitize the parsed JSON
-                        json_data = self._sanitize_body(json_data)
-                        sanitized = json.dumps(json_data)
-                except:
-                    # If it's not valid JSON, just continue
-                    pass
-            
-            return sanitized
-        
-        # Sanitize API keys and other sensitive information
-        if isinstance(sanitized, dict):
-            # Expanded list of sensitive field names
-            sensitive_fields = [
-                "api_key", "apiKey", "key", "token", "secret", "password",
-                "access_token", "refresh_token", "auth_token", "jwt", 
-                "openai_api_key", "anthropic_api_key", "bearer_token",
-                "api-key", "authorization"
-            ]
-            
-            for field in sensitive_fields:
-                if field in sanitized:
-                    sanitized[field] = "[REDACTED]"
-                
-                # Check for nested fields
-                for key, value in sanitized.items():
-                    if isinstance(value, dict):
-                        for nested_field in sensitive_fields:
-                            if nested_field in value:
-                                sanitized[key][nested_field] = "[REDACTED]"
-            
-            # Sanitize authorization headers
-            if "headers" in sanitized and isinstance(sanitized["headers"], dict):
-                sanitized["headers"] = self._sanitize_headers(sanitized["headers"])
-            
-            # Handle messages with potentially sensitive content
-            if not os.environ.get("LOG_TOKENS", "false").lower() == "true":
-                # Redact message content if token logging is disabled
-                if "messages" in sanitized and isinstance(sanitized["messages"], list):
-                    for i, message in enumerate(sanitized["messages"]):
-                        if isinstance(message, dict) and "content" in message:
-                            if isinstance(message["content"], str):
-                                # Only redact content in non-test mode
-                                if not os.environ.get("TESTING", "false").lower() == "true":
-                                    sanitized["messages"][i]["content"] = "[CONTENT REDACTED]"
-                            elif isinstance(message["content"], list):
-                                for j, content_item in enumerate(message["content"]):
-                                    if isinstance(content_item, dict) and content_item.get("type") == "text":
-                                        # Only redact content in non-test mode
-                                        if not os.environ.get("TESTING", "false").lower() == "true":
-                                            sanitized["messages"][i]["content"][j]["text"] = "[CONTENT REDACTED]"
-                
-                # Handle Anthropic system prompt
-                if "system" in sanitized:
-                    # Only redact system prompt in non-test mode
-                    if not os.environ.get("TESTING", "false").lower() == "true":
-                        sanitized["system"] = "[SYSTEM PROMPT REDACTED]"
-        
-        # Final check for string values that might contain API keys
-        if isinstance(sanitized, str):
-            sanitized = redact_api_key(sanitized)
-            
-        return sanitized 
+        """No longer sanitizes body - returns it as is"""
+        return body 

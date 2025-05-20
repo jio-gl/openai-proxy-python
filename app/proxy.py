@@ -93,13 +93,7 @@ class BaseAPIProxy:
                                 if chunk_data.strip() != '[DONE]':
                                     try:
                                         chunk_json = json.loads(chunk_data)
-                                        # Redact sensitive content in streaming response
-                                        if isinstance(chunk_json, dict) and 'choices' in chunk_json:
-                                            for choice in chunk_json['choices']:
-                                                if isinstance(choice, dict):
-                                                    if 'delta' in choice and isinstance(choice['delta'], dict):
-                                                        if 'content' in choice['delta']:
-                                                            choice['delta']['content'] = '[CONTENT REDACTED FOR PRIVACY]'
+                                        # Log the full chunk without redaction
                                         self.logger.debug(f"Streaming response chunk {request_id}: {json.dumps(chunk_json)}")
                                     except json.JSONDecodeError:
                                         pass  # Not all chunks are JSON
@@ -261,7 +255,6 @@ class OpenAIProxy(BaseAPIProxy):
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
         if debug_mode:
             auth_header = orig_headers.get("Authorization", "")
-            # Don't redact API key in debug mode
             self.logger.debug(f"Authorization header: {auth_header}")
             self.logger.debug(f"Authorization header from settings: {self.headers.get('Authorization')}")
 
@@ -349,12 +342,6 @@ class OpenAIProxy(BaseAPIProxy):
         # Get body
         if method in ("POST", "PUT", "PATCH"):
             try:
-                # Log the request reading to help diagnose issues
-                if debug_mode:
-                    self.logger.debug(f"Reading request body for {request_id}")
-
-                # Don't use retries - they may be causing issues
-                # Instead, just read the body cleanly once with proper error handling
                 body_bytes = await request.body()
                 if not body_bytes:
                     self.logger.warning(f"Empty request body for {method} request")
@@ -369,20 +356,8 @@ class OpenAIProxy(BaseAPIProxy):
                 try:
                     body = json.loads(body_bytes)
                     if debug_mode:
-                        # Create a sanitized version for logging
-                        sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
-                        # Redact sensitive fields
-                        if isinstance(sanitized_body, dict):
-                            if "api_key" in sanitized_body:
-                                sanitized_body["api_key"] = "[REDACTED]"
-                            # Redact any potential sensitive data in messages
-                            if "messages" in sanitized_body:
-                                for msg in sanitized_body["messages"]:
-                                    if isinstance(msg, dict) and "content" in msg:
-                                        msg["content"] = "[CONTENT REDACTED FOR PRIVACY]"
-                        # Log the sanitized body
-                        body_json = json.dumps(sanitized_body)
-                        body_json = redact_api_key(body_json)
+                        # Log the full body without redaction
+                        body_json = json.dumps(body)
                         self.logger.debug(f"Request body {request_id}: {body_json}")
                     
                     # Log the request
@@ -402,7 +377,6 @@ class OpenAIProxy(BaseAPIProxy):
                     content={"error": {"message": f"Error processing request: {str(e)}", "type": "request_error"}}
                 )
         else:
-            # For non-body methods
             body = {}
             self.request_logger.log_request(request_id, method, path, headers, body)
         
