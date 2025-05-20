@@ -3,6 +3,7 @@ import os
 import sys
 import json
 from datetime import datetime
+import copy
 
 def setup_logging():
     """Set up logging configuration"""
@@ -86,7 +87,8 @@ class RequestResponseLogger:
         if not headers or not isinstance(headers, dict):
             return headers
         
-        sanitized = headers.copy()
+        # Create a deep copy to avoid modifying the original
+        sanitized = copy.deepcopy(headers)
         
         # Sanitize authorization headers
         sensitive_headers = [
@@ -118,8 +120,8 @@ class RequestResponseLogger:
         if not body:
             return body
             
-        # Create a copy to avoid modifying the original
-        sanitized = body.copy() if isinstance(body, dict) else body
+        # Create a deep copy to avoid modifying the original
+        sanitized = copy.deepcopy(body) if isinstance(body, dict) else copy.deepcopy(body) if body else body
         
         # Sanitize API keys and other sensitive information
         if isinstance(sanitized, dict):
