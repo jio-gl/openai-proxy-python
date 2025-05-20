@@ -4,6 +4,7 @@ import logging
 import uuid
 import os
 import asyncio
+import random
 from fastapi import Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.background import BackgroundTask
@@ -158,7 +159,6 @@ class OpenAIProxy(BaseAPIProxy):
             
         # Use a randomized approach for domains to avoid pattern detection
         # Sometimes we'll use direct URL, sometimes third-party domains
-        import random
         
         # Always use the real OpenAI domain for reliability
         target_host = "api.openai.com"

@@ -137,13 +137,15 @@ Debug mode provides detailed request and response information, useful for troubl
 
 1. All request headers and bodies will be logged to the console
 2. All response headers will be logged to the console
-3. Full content of messages will be preserved in logs (rather than being redacted)
+3. API keys and other sensitive information are automatically redacted for security
 
 To enable debug mode:
 - Use the `--debug` command line flag when starting the server
-- OR set `LOG_LEVEL=DEBUG` and `LOG_TOKENS=true` in your `.env` file
+- OR set `LOG_LEVEL=DEBUG` in your `.env` file
 
-**Note**: Debug mode will expose sensitive information in logs, so use it carefully and only in secure environments.
+Debug mode is designed to work seamlessly with the OpenAI API, allowing you to see exactly what is being sent and received without interfering with the request/response flow.
+
+**Note**: While debug mode redacts sensitive information like API keys, exercise caution when sharing logs as they may contain prompt content or other potentially sensitive data.
 
 ## Organization ID Handling
 
@@ -176,6 +178,14 @@ If you see "OpenAI-Organization header should match organization for API key" er
 2. Ensure you're not setting a different organization ID in your client
 3. Restart the proxy server
 
+### Debug Mode Issues
+
+If you encounter issues with debug mode:
+
+1. Make sure you're using the latest version of the proxy
+2. Check that your environment does not have conflicting `LOG_LEVEL` settings
+3. If streaming responses aren't working correctly in debug mode, try setting `LOG_LEVEL=INFO` in your `.env` file
+
 ### Connection Issues
 
 If you cannot connect to the proxy:
@@ -183,6 +193,16 @@ If you cannot connect to the proxy:
 1. Verify the server is running (`python run.py`)
 2. Check if the port is already in use (`lsof -i :8000`)
 3. Ensure your client is configured to use the correct URL
+4. If using a custom port, update your client URL to match (e.g., `http://localhost:8001/v1`)
+
+### Rate Limiting or Timeout Errors
+
+If you receive rate limiting or timeout errors from OpenAI:
+
+1. Check your OpenAI API usage dashboard for any account limitations
+2. Verify your API key has sufficient quota remaining
+3. Try increasing the timeout settings in the proxy (edit `app/proxy.py`)
+4. Run the proxy with debug mode to see the exact error messages from OpenAI
 
 ## Docker Support
 
@@ -193,6 +213,14 @@ docker-compose up -d
 ```
 
 ## Recent Changes
+
+### Version 1.2.0
+
+- Completely redesigned debug mode for improved reliability
+- Fixed issues with request body handling in middleware
+- Added robust error handling throughout the codebase
+- Added API key redaction to protect sensitive data in logs
+- Added enhanced support for streaming responses in debug mode
 
 ### Version 1.1.0
 
