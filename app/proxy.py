@@ -62,8 +62,8 @@ class BaseAPIProxy:
         # Check if we're in debug mode to adjust timeouts
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
         
-        # Use shorter timeout in debug mode to prevent tests from hanging
-        timeout_seconds = 15.0 if debug_mode else 300.0
+        # Use longer timeout for streaming to prevent truncation
+        timeout_seconds = 150.0 if debug_mode else 600.0
         
         async def stream_generator():
             # Use a fresh client for streaming
@@ -104,19 +104,9 @@ class BaseAPIProxy:
                         {"streaming": True}
                     )
                     
-                    # Stream the bytes directly
-                    # In debug mode, we'll limit the number of chunks to process to avoid hanging
-                    chunk_count = 0
-                    max_chunks = 1000 if not debug_mode else 10
-                    
+                    # Stream the bytes directly without any artificial limits
                     async for chunk in response.aiter_bytes():
                         yield chunk
-                        chunk_count += 1
-                        
-                        # In debug mode, stop after a few chunks to avoid hanging tests
-                        if debug_mode and chunk_count >= max_chunks:
-                            self.logger.debug(f"Debug mode: Processed {chunk_count} chunks, stopping early")
-                            break
                             
             except httpx.TimeoutException as e:
                 self.logger.error(f"Timeout in streaming response: {str(e)}")
