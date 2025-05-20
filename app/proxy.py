@@ -155,8 +155,9 @@ class BaseAPIProxy:
                 if status_code == 429:
                     self.logger.warning(f"Rate limit exceeded for request {request_id}")
                     try:
-                        # Read the full response body for error details
-                        error_body = await response.json()
+                        # Read the full response content for error details
+                        error_content = await response.aread()
+                        error_body = json.loads(error_content.decode('utf-8'))
                         self.logger.error(f"Rate limit error details: {json.dumps(error_body, indent=2)}")
                         
                         # Create a proper error response
@@ -169,7 +170,7 @@ class BaseAPIProxy:
                         # Fallback error message
                         error_msg = {
                             "error": {
-                                "message": f"Rate limit exceeded. Check API key limits: {str(e)}",
+                                "message": f"Rate limit exceeded. Check API key limits.",
                                 "type": "rate_limit_error",
                                 "headers": {k: v for k, v in response_headers.items() if 'ratelimit' in k.lower()}
                             }
