@@ -121,7 +121,7 @@ class BaseAPIProxy:
             yield f"data: {error_msg}\n\n".encode('utf-8')
             yield b"data: [DONE]\n\n"
 
-    async def _handle_streaming_request(self, client, method, target_url, headers, body, request_id):
+    async def _handle_streaming_request(self, client, method, target_url, headers, body, request_id, log_response):
         """Handle a streaming request"""
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
         
@@ -131,13 +131,7 @@ class BaseAPIProxy:
             if body:
                 try:
                     sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
-                    if isinstance(sanitized_body, dict):
-                        if "messages" in sanitized_body:
-                            for msg in sanitized_body["messages"]:
-                                if isinstance(msg, dict) and "content" in msg:
-                                    msg["content"] = "[CONTENT REDACTED FOR PRIVACY]"
                     body_json = json.dumps(sanitized_body)
-                    body_json = redact_api_key(body_json)
                     self.logger.debug(f"Streaming request body {request_id}: {body_json}")
                     
                     # Log current cookies
@@ -146,29 +140,12 @@ class BaseAPIProxy:
                 except Exception as e:
                     self.logger.debug(f"Could not log streaming request details {request_id}: {str(e)}")
         
-        # Create a copy of headers that's safe to modify
-        stream_headers = headers.copy()
-        
-        # Ensure proper streaming headers
-        stream_headers.update({
-            "Accept": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked"
-        })
-        
-        # Remove any content-length header as it interferes with chunked encoding
-        stream_headers.pop("content-length", None)
-        
-        # Extract domain from target URL for cookie handling
-        target_domain = urllib.parse.urlparse(target_url).netloc
-        
         try:
             # Make the streaming request with proper timeout settings
             async with client.stream(
                 method=method,
                 url=target_url,
-                headers=stream_headers,
+                headers=headers,
                 json=body if method in ("POST", "PUT", "PATCH") else None,
                 timeout=httpx.Timeout(
                     connect=10.0,    # Connection timeout
@@ -177,6 +154,22 @@ class BaseAPIProxy:
                     pool=None        # No pool timeout
                 )
             ) as response:
+                # Log response details including rate limits
+                status_code, response_headers = await log_response(response, True)
+                
+                if status_code == 429:
+                    error_msg = json.dumps({
+                        "error": {
+                            "message": "Rate limit exceeded",
+                            "type": "rate_limit_error",
+                            "headers": {k: v for k, v in response_headers.items() if 'ratelimit' in k.lower()}
+                        }
+                    })
+                    return JSONResponse(
+                        status_code=429,
+                        content=json.loads(error_msg)
+                    )
+                
                 # Extract and update cookies from response
                 if "set-cookie" in response.headers:
                     self.logger.debug(f"Found Set-Cookie header in streaming response {request_id}")
@@ -268,8 +261,9 @@ class OpenAIProxy(BaseAPIProxy):
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
         if debug_mode:
             auth_header = orig_headers.get("Authorization", "")
-            self.logger.debug(f"Authorization header present: {bool(auth_header)}")
-            self.logger.debug(f"Authorization header from settings present: {bool(self.headers.get('Authorization'))}")
+            # Don't redact API key in debug mode
+            self.logger.debug(f"Authorization header: {auth_header}")
+            self.logger.debug(f"Authorization header from settings: {self.headers.get('Authorization')}")
 
         # Pick a random real browser user agent
         browser_agents = [
@@ -437,7 +431,7 @@ class OpenAIProxy(BaseAPIProxy):
         if is_streaming:
             if debug_mode:
                 self.logger.debug(f"Handling streaming request to {target_url}")
-            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id)
+            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id, self._log_response)
             
         # Regular API call
         try:
@@ -571,7 +565,7 @@ class OpenAIProxy(BaseAPIProxy):
                     http2=False,  # Fallback to HTTP/1.1
                 ) as client:
                     if is_streaming:
-                        return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
+                        return await self._handle_streaming_request(client, method, target_url, headers, body, request_id, self._log_response)
                     
                     if debug_mode:
                         self.logger.debug(f"Sending fallback request to: {target_url}")
@@ -768,6 +762,25 @@ class OpenAIProxy(BaseAPIProxy):
             headers=headers
         )
 
+    async def _log_response(self, response, is_streaming=False):
+        status_code = response.status_code
+        response_headers = dict(response.headers)
+        
+        # Log rate limit headers if present
+        rate_limit_headers = {k: v for k, v in response_headers.items() if 'ratelimit' in k.lower()}
+        if rate_limit_headers:
+            self.logger.debug(f"Rate limit info for {request_id}: {json.dumps(rate_limit_headers, indent=2)}")
+        
+        # Log error response body if status is not 200
+        if status_code != 200:
+            try:
+                error_body = await response.json()
+                self.logger.debug(f"Error response body for {request_id}: {json.dumps(error_body, indent=2)}")
+            except Exception as e:
+                self.logger.debug(f"Could not parse error response body for {request_id}: {str(e)}")
+        
+        return status_code, response_headers
+
 class AnthropicProxy(BaseAPIProxy):
     """Proxy for Anthropic API requests"""
     
@@ -948,7 +961,7 @@ class AnthropicProxy(BaseAPIProxy):
         if is_streaming:
             if debug_mode:
                 self.logger.debug(f"Handling Anthropic streaming request to {target_url}")
-            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id)
+            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id, self._log_response)
         
         # Regular API call
         try:
@@ -970,7 +983,7 @@ class AnthropicProxy(BaseAPIProxy):
             ) as client:
                 # Handle streaming responses
                 if body and body.get("stream", False):
-                    return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
+                    return await self._handle_streaming_request(client, method, target_url, headers, body, request_id, self._log_response)
                 
                 try:
                     # Handle regular responses - pass full URL directly
@@ -1080,7 +1093,7 @@ class AnthropicProxy(BaseAPIProxy):
                     http2=False,  # Fallback to HTTP/1.1
                 ) as client:
                     if is_streaming:
-                        return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
+                        return await self._handle_streaming_request(client, method, target_url, headers, body, request_id, self._log_response)
                     
                     if debug_mode:
                         self.logger.debug(f"Sending fallback request to: {target_url}")
