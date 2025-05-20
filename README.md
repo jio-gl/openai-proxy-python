@@ -257,15 +257,15 @@ Apache License 2.0
 
 ## Recent Improvements
 
-### 1.2.0 (June 2025) - Public Release
+### 0.2.0 (18th May 2025) - Public Release
 
-- **Added**: MIT License file
+- **Added**: Apache 2.0 License file
 - **Added**: Improved setup for public networks via ngrok or SSH tunneling
 - **Added**: Proper gitignore file for better repository management
 - **Fixed**: Removed sensitive data from example files
 - **Improved**: Documentation for direct deployment and cloud hosting options
 
-### 1.1.0 (May 2025)
+### 0.1.0 (11th May 2025)
 
 - **Fixed**: Resolved "Too little data for declared Content-Length" error by implementing proper content-length handling for all JSON responses.
 - **Fixed**: Created SafeJSONResponse class to ensure consistent content-length headers for all API responses.
