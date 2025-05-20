@@ -78,94 +78,74 @@ class BaseAPIProxy:
         """Generate a mock response for testing"""
         raise NotImplementedError("Subclasses must implement this method")
     
-    async def _handle_streaming_request(self, client, method, url, headers, body, request_id):
-        """Handle streaming responses from API"""
-        self.logger.info(f"Handling streaming request {request_id} to {url}")
+    async def _handle_streaming_request(self, client, method, target_url, headers, body, request_id):
+        """Handle a streaming request"""
+        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
         
-        # Create a copy of headers that's safe to modify
-        stream_headers = headers.copy()
+        if debug_mode:
+            self.logger.debug(f"Handling streaming request to {target_url}")
+            # Log streaming request body
+            if body:
+                try:
+                    sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
+                    if isinstance(sanitized_body, dict):
+                        if "messages" in sanitized_body:
+                            for msg in sanitized_body["messages"]:
+                                if isinstance(msg, dict) and "content" in msg:
+                                    msg["content"] = "[CONTENT REDACTED FOR PRIVACY]"
+                    body_json = json.dumps(sanitized_body)
+                    body_json = redact_api_key(body_json)
+                    self.logger.debug(f"Streaming request body {request_id}: {body_json}")
+                except Exception as e:
+                    self.logger.debug(f"Could not log streaming request body {request_id}: {str(e)}")
         
-        # Ensure proper streaming headers
-        stream_headers.update({
-            "Connection": "keep-alive",
-            "Accept": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Transfer-Encoding": "chunked"
-        })
-        
-        # Remove any content-length header as it interferes with chunked encoding
-        stream_headers.pop("content-length", None)
-        
-        async def stream_generator():
-            try:
-                # Use the persistent streaming client
-                async with self.streaming_client.stream(
-                    method=method,
-                    url=url,
-                    headers=stream_headers,
-                    json=body,
-                    timeout=None  # Use client's timeout settings
-                ) as response:
-                    # Copy cookies from response to our cookie jar
-                    if "set-cookie" in response.headers:
-                        self.streaming_client.cookies.extract_cookies(response)
-                    
-                    response_headers = dict(response.headers)
-                    response_headers.pop("content-length", None)  # Remove content-length
-                    
-                    # Copy any new cookies to the main client's cookie jar
-                    for cookie in self.streaming_client.cookies.jar:
-                        self.client.cookies.set(
-                            cookie.name,
-                            cookie.value,
-                            domain=cookie.domain,
-                            path=cookie.path
-                        )
-                    
-                    self.request_logger.log_response(
-                        request_id, 
-                        response.status_code, 
-                        response_headers, 
-                        {"streaming": True}
-                    )
-                    
-                    # Stream chunks with proper error handling
-                    async for chunk in response.aiter_bytes():
-                        if chunk:  # Only yield non-empty chunks
-                            yield chunk
-                    
-                    # Ensure proper stream termination
-                    yield b"data: [DONE]\n\n"
-                            
-            except httpx.TimeoutException as e:
-                self.logger.error(f"Timeout in streaming response: {str(e)}")
-                yield f"data: {json.dumps({'error': {'message': 'Stream timed out', 'type': 'timeout_error'}})}\n\n".encode()
-                yield b"data: [DONE]\n\n"
-                
-            except Exception as e:
-                self.logger.error(f"Error in streaming response: {str(e)}")
-                yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'stream_error'}})}\n\n".encode()
-                yield b"data: [DONE]\n\n"
-        
-        # Set response headers for streaming
-        response_headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-            "Access-Control-Allow-Private-Network": "true",
-            "Access-Control-Expose-Headers": "*",
-            "X-Accel-Buffering": "no"  # Disable proxy buffering
-        }
-        
-        return StreamingResponse(
-            stream_generator(),
-            media_type="text/event-stream",
-            headers=response_headers
-        )
+        try:
+            # Make the streaming request
+            async with client.stream(
+                method=method,
+                url=target_url,
+                headers=headers,
+                json=body if method in ("POST", "PUT", "PATCH") else None
+            ) as response:
+                # Create the streaming response
+                return StreamingResponse(
+                    self._process_stream(response, request_id, debug_mode),
+                    status_code=response.status_code,
+                    headers=dict(response.headers)
+                )
+        except Exception as e:
+            self.logger.error(f"Error in streaming request: {str(e)}")
+            raise
+
+    async def _process_stream(self, response, request_id, debug_mode=False):
+        """Process a streaming response"""
+        try:
+            async for chunk in response.aiter_bytes():
+                if debug_mode:
+                    try:
+                        # Try to decode and parse the chunk for logging
+                        chunk_str = chunk.decode('utf-8')
+                        if chunk_str.startswith('data: '):
+                            chunk_data = chunk_str.replace('data: ', '')
+                            if chunk_data.strip() != '[DONE]':
+                                try:
+                                    chunk_json = json.loads(chunk_data)
+                                    # Redact sensitive content in streaming response
+                                    if isinstance(chunk_json, dict) and 'choices' in chunk_json:
+                                        for choice in chunk_json['choices']:
+                                            if isinstance(choice, dict):
+                                                if 'delta' in choice and isinstance(choice['delta'], dict):
+                                                    if 'content' in choice['delta']:
+                                                        choice['delta']['content'] = '[CONTENT REDACTED FOR PRIVACY]'
+                                    self.logger.debug(f"Streaming response chunk {request_id}: {json.dumps(chunk_json)}")
+                                except json.JSONDecodeError:
+                                    pass  # Not all chunks are JSON
+                    except Exception as e:
+                        self.logger.debug(f"Could not log streaming chunk {request_id}: {str(e)}")
+                yield chunk
+        except Exception as e:
+            self.logger.error(f"Error processing stream: {str(e)}")
+            raise
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -329,6 +309,11 @@ class OpenAIProxy(BaseAPIProxy):
                         if isinstance(sanitized_body, dict):
                             if "api_key" in sanitized_body:
                                 sanitized_body["api_key"] = "[REDACTED]"
+                            # Redact any potential sensitive data in messages
+                            if "messages" in sanitized_body:
+                                for msg in sanitized_body["messages"]:
+                                    if isinstance(msg, dict) and "content" in msg:
+                                        msg["content"] = "[CONTENT REDACTED FOR PRIVACY]"
                         # Log the sanitized body
                         body_json = json.dumps(sanitized_body)
                         body_json = redact_api_key(body_json)
@@ -420,6 +405,24 @@ class OpenAIProxy(BaseAPIProxy):
                 
                 if debug_mode:
                     self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
+                    # Log response body in debug mode
+                    try:
+                        response_body = response.json()
+                        # Create a sanitized version for logging
+                        sanitized_response = copy.deepcopy(response_body) if isinstance(response_body, dict) else response_body
+                        # Redact sensitive fields in response
+                        if isinstance(sanitized_response, dict):
+                            # Redact any potential sensitive data in response messages
+                            if "choices" in sanitized_response:
+                                for choice in sanitized_response["choices"]:
+                                    if isinstance(choice, dict) and "message" in choice:
+                                        if isinstance(choice["message"], dict) and "content" in choice["message"]:
+                                            choice["message"]["content"] = "[CONTENT REDACTED FOR PRIVACY]"
+                        response_json = json.dumps(sanitized_response)
+                        response_json = redact_api_key(response_json)
+                        self.logger.debug(f"Response body {request_id}: {response_json}")
+                    except Exception as e:
+                        self.logger.debug(f"Could not log response body {request_id}: {str(e)}")
                 
                 # Extract cookies from response and update our cookie jar
                 if "set-cookie" in response_headers:
@@ -804,6 +807,11 @@ class AnthropicProxy(BaseAPIProxy):
                         if isinstance(sanitized_body, dict):
                             if "api_key" in sanitized_body:
                                 sanitized_body["api_key"] = "[REDACTED]"
+                            # Redact any potential sensitive data in messages
+                            if "messages" in sanitized_body:
+                                for msg in sanitized_body["messages"]:
+                                    if isinstance(msg, dict) and "content" in msg:
+                                        msg["content"] = "[CONTENT REDACTED FOR PRIVACY]"
                         # Log the sanitized body
                         body_json = json.dumps(sanitized_body)
                         body_json = redact_api_key(body_json)
