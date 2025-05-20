@@ -169,6 +169,13 @@ class OpenAIProxy(BaseAPIProxy):
         method = request.method
         orig_headers = dict(request.headers)
 
+        # Log debug information about auth header presence
+        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+        if debug_mode:
+            auth_header = orig_headers.get("Authorization", "")
+            self.logger.debug(f"Authorization header present: {bool(auth_header)}")
+            self.logger.debug(f"Authorization header from settings present: {bool(self.headers.get('Authorization'))}")
+
         # Pick a random real browser user agent
         browser_agents = [
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -243,10 +250,22 @@ class OpenAIProxy(BaseAPIProxy):
         # Get body
         if method in ("POST", "PUT", "PATCH"):
             try:
-                body = await request.json()
+                # Log the request reading to help diagnose issues
+                if debug_mode:
+                    self.logger.debug(f"Attempting to read request body for {request_id}")
+                
+                # Get the request body
+                body_bytes = await request.body()
+                if debug_mode:
+                    self.logger.debug(f"Successfully read request body: {len(body_bytes)} bytes")
+                    
+                # Parse the JSON
+                body = json.loads(body_bytes)
                 self.request_logger.log_request(request_id, method, path, headers, body)
             except Exception as e:
                 self.logger.error(f"Error parsing request body: {str(e)}")
+                if debug_mode:
+                    self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
                 empty_body = {}
                 self.request_logger.log_request(request_id, method, path, headers, empty_body)
                 return SafeJSONResponse(
@@ -280,10 +299,16 @@ class OpenAIProxy(BaseAPIProxy):
         # Handle streaming responses
         is_streaming = "stream" in body and body["stream"] is True
         if is_streaming:
+            if debug_mode:
+                self.logger.debug(f"Handling streaming request to {target_url}")
             return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id)
             
         # Regular API call
         try:
+            # Log the client creation attempt
+            if debug_mode:
+                self.logger.debug(f"Creating HTTP client for request to {target_url}")
+                
             # Simplify the client configuration for reliability
             async with httpx.AsyncClient(
                 timeout=300.0,  # 5 minute timeout
@@ -293,6 +318,10 @@ class OpenAIProxy(BaseAPIProxy):
             ) as client:
                 # Handle regular responses - pass full URL directly
                 self.logger.info(f"Sending request to: {target_url}")
+                if debug_mode:
+                    self.logger.debug(f"Request body to OpenAI: {json.dumps(body)}")
+                    
+                # Make the actual request
                 response = await client.request(
                     method=method,
                     url=target_url,  # Use full target URL to ensure proper SNI
@@ -305,6 +334,9 @@ class OpenAIProxy(BaseAPIProxy):
                 status_code = response.status_code
                 response_headers = dict(response.headers)
                 
+                if debug_mode:
+                    self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
+                
                 # Remove content-encoding to prevent decoding issues
                 if "content-encoding" in response_headers:
                     del response_headers["content-encoding"]
@@ -312,6 +344,8 @@ class OpenAIProxy(BaseAPIProxy):
                 # Pass through binary response by default
                 try:
                     response_body = response.json()
+                    if debug_mode:
+                        self.logger.debug(f"Response body: {json.dumps(response_body)}")
                     self.request_logger.log_response(request_id, status_code, response_headers, response_body)
                     # Add CORS and private network headers
                     response_headers.update({
@@ -322,8 +356,10 @@ class OpenAIProxy(BaseAPIProxy):
                         "Access-Control-Expose-Headers": "*"
                     })
                     return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                except:
+                except Exception as json_error:
                     # Just return the raw response content with the modified headers
+                    if debug_mode:
+                        self.logger.debug(f"Non-JSON response, returning raw content: {str(json_error)}")
                     self.request_logger.log_response(
                         request_id, 
                         status_code, 
@@ -340,8 +376,13 @@ class OpenAIProxy(BaseAPIProxy):
                     )
         except Exception as e:
             self.logger.error(f"Error creating client or making request: {str(e)}")
+            if debug_mode:
+                self.logger.debug(f"Detailed error: {type(e).__name__}: {str(e)}")
+                
             # Fallback to HTTP/1.1 if HTTP/2 fails
             try:
+                if debug_mode:
+                    self.logger.debug("Falling back to HTTP/1.1")
                 async with httpx.AsyncClient(
                     timeout=300.0,
                     verify=True,
@@ -354,6 +395,9 @@ class OpenAIProxy(BaseAPIProxy):
                     if is_streaming:
                         return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
                     
+                    if debug_mode:
+                        self.logger.debug(f"Sending fallback request to: {target_url}")
+                        
                     response = await client.request(
                         method=method,
                         url=target_url,
@@ -365,6 +409,9 @@ class OpenAIProxy(BaseAPIProxy):
                     # Get response data
                     status_code = response.status_code
                     response_headers = dict(response.headers)
+                    
+                    if debug_mode:
+                        self.logger.debug(f"Fallback response received: status={status_code}")
                     
                     # Remove content-encoding to prevent decoding issues
                     if "content-encoding" in response_headers:
@@ -401,6 +448,8 @@ class OpenAIProxy(BaseAPIProxy):
                         )
             except Exception as fallback_error:
                 self.logger.error(f"Error in fallback HTTP/1.1 request: {str(fallback_error)}")
+                if debug_mode:
+                    self.logger.debug(f"Detailed fallback error: {type(fallback_error).__name__}: {str(fallback_error)}")
                 error_content = {"error": {"message": f"Error communicating with OpenAI API: {str(fallback_error)}", "type": "proxy_error"}}
                 error_json = json.dumps(error_content).encode('utf-8')
                 return SafeJSONResponse(
@@ -558,6 +607,9 @@ class AnthropicProxy(BaseAPIProxy):
         # Get request method
         method = request.method
         
+        # Check if we're in debug mode
+        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+        
         # Build target URL - Anthropic has no v1 in base URL unlike OpenAI
         target_url = f"{self.settings.anthropic_base_url}/{path.lstrip('/')}"
         
@@ -569,6 +621,12 @@ class AnthropicProxy(BaseAPIProxy):
         
         # Get original headers
         orig_headers = dict(request.headers)
+        
+        # Log debug information about auth header presence
+        if debug_mode:
+            auth_header = orig_headers.get("x-api-key", "")
+            self.logger.debug(f"x-api-key header present: {bool(auth_header)}")
+            self.logger.debug(f"x-api-key from settings present: {bool(self.headers.get('x-api-key'))}")
         
         # Pick a random real browser user agent
         browser_agents = [
@@ -617,10 +675,22 @@ class AnthropicProxy(BaseAPIProxy):
         # Get body
         if method in ("POST", "PUT", "PATCH"):
             try:
-                body = await request.json()
+                # Log the request reading to help diagnose issues
+                if debug_mode:
+                    self.logger.debug(f"Attempting to read Anthropic request body for {request_id}")
+                
+                # Get the request body
+                body_bytes = await request.body()
+                if debug_mode:
+                    self.logger.debug(f"Successfully read Anthropic request body: {len(body_bytes)} bytes")
+                    
+                # Parse the JSON
+                body = json.loads(body_bytes)
                 self.request_logger.log_request(request_id, method, path, headers, body)
             except Exception as e:
                 self.logger.error(f"Error parsing request body: {str(e)}")
+                if debug_mode:
+                    self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
                 empty_body = {}
                 self.request_logger.log_request(request_id, method, path, headers, empty_body)
                 return SafeJSONResponse(
@@ -668,10 +738,16 @@ class AnthropicProxy(BaseAPIProxy):
         # Check if this is a streaming request
         is_streaming = body.get("stream", False) is True
         if is_streaming:
+            if debug_mode:
+                self.logger.debug(f"Handling Anthropic streaming request to {target_url}")
             return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id)
         
         # Regular API call
         try:
+            # Log the client creation attempt
+            if debug_mode:
+                self.logger.debug(f"Creating HTTP client for Anthropic request to {target_url}")
+                
             # Simplify the client configuration for reliability
             async with httpx.AsyncClient(
                 timeout=300.0,  # 5 minute timeout
@@ -686,6 +762,10 @@ class AnthropicProxy(BaseAPIProxy):
                 try:
                     # Handle regular responses - pass full URL directly
                     self.logger.info(f"Sending request to: {target_url}")
+                    if debug_mode:
+                        self.logger.debug(f"Request body to Anthropic: {json.dumps(body)}")
+                        
+                    # Make the actual request
                     response = await client.request(
                         method=method,
                         url=target_url,  # Use full target URL to ensure proper SNI
@@ -698,6 +778,9 @@ class AnthropicProxy(BaseAPIProxy):
                     status_code = response.status_code
                     response_headers = dict(response.headers)
                     
+                    if debug_mode:
+                        self.logger.debug(f"Anthropic response received: status={status_code}, headers={response_headers}")
+                    
                     # Remove content-encoding to prevent decoding issues
                     if "content-encoding" in response_headers:
                         del response_headers["content-encoding"]
@@ -705,6 +788,8 @@ class AnthropicProxy(BaseAPIProxy):
                     # Pass through binary response by default
                     try:
                         response_body = response.json()
+                        if debug_mode:
+                            self.logger.debug(f"Anthropic response body: {json.dumps(response_body)}")
                         self.request_logger.log_response(request_id, status_code, response_headers, response_body)
                         # Add CORS and private network headers
                         response_headers.update({
@@ -715,8 +800,10 @@ class AnthropicProxy(BaseAPIProxy):
                             "Access-Control-Expose-Headers": "*"
                         })
                         return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                    except:
+                    except Exception as json_error:
                         # Just return the raw response content with the modified headers
+                        if debug_mode:
+                            self.logger.debug(f"Non-JSON Anthropic response, returning raw content: {str(json_error)}")
                         self.request_logger.log_response(
                             request_id, 
                             status_code, 
@@ -733,6 +820,8 @@ class AnthropicProxy(BaseAPIProxy):
                         )
                 except Exception as e:
                     self.logger.error(f"Error making request to Anthropic API: {str(e)}")
+                    if debug_mode:
+                        self.logger.debug(f"Detailed Anthropic error: {type(e).__name__}: {str(e)}")
                     error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(e)}", "type": "proxy_error"}}
                     error_json = json.dumps(error_content).encode('utf-8')
                     return SafeJSONResponse(
@@ -742,8 +831,13 @@ class AnthropicProxy(BaseAPIProxy):
                     )
         except Exception as e:
             self.logger.error(f"Error creating client or making request: {str(e)}")
+            if debug_mode:
+                self.logger.debug(f"Detailed error: {type(e).__name__}: {str(e)}")
+                
             # Fallback to HTTP/1.1 if HTTP/2 fails
             try:
+                if debug_mode:
+                    self.logger.debug("Falling back to HTTP/1.1 for Anthropic")
                 async with httpx.AsyncClient(
                     timeout=300.0,
                     verify=True,
@@ -756,6 +850,9 @@ class AnthropicProxy(BaseAPIProxy):
                     if body and body.get("stream", False):
                         return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
                     
+                    if debug_mode:
+                        self.logger.debug(f"Sending fallback request to Anthropic: {target_url}")
+                        
                     response = await client.request(
                         method=method,
                         url=target_url,
@@ -768,6 +865,9 @@ class AnthropicProxy(BaseAPIProxy):
                     status_code = response.status_code
                     response_headers = dict(response.headers)
                     
+                    if debug_mode:
+                        self.logger.debug(f"Fallback Anthropic response received: status={status_code}")
+                    
                     # Remove content-encoding to prevent decoding issues
                     if "content-encoding" in response_headers:
                         del response_headers["content-encoding"]
@@ -775,6 +875,8 @@ class AnthropicProxy(BaseAPIProxy):
                     # Pass through binary response by default
                     try:
                         response_body = response.json()
+                        if debug_mode:
+                            self.logger.debug(f"Fallback Anthropic response body: {json.dumps(response_body)}")
                         self.request_logger.log_response(request_id, status_code, response_headers, response_body)
                         # Add CORS and private network headers
                         response_headers.update({
@@ -785,8 +887,10 @@ class AnthropicProxy(BaseAPIProxy):
                             "Access-Control-Expose-Headers": "*"
                         })
                         return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                    except:
+                    except Exception as json_error:
                         # Just return the raw response content with the modified headers
+                        if debug_mode:
+                            self.logger.debug(f"Non-JSON fallback Anthropic response: {str(json_error)}")
                         self.request_logger.log_response(
                             request_id, 
                             status_code, 
@@ -803,6 +907,8 @@ class AnthropicProxy(BaseAPIProxy):
                         )
             except Exception as fallback_error:
                 self.logger.error(f"Error in fallback HTTP/1.1 request: {str(fallback_error)}")
+                if debug_mode:
+                    self.logger.debug(f"Detailed fallback error: {type(fallback_error).__name__}: {str(fallback_error)}")
                 error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(fallback_error)}", "type": "proxy_error"}}
                 error_json = json.dumps(error_content).encode('utf-8')
                 return SafeJSONResponse(
