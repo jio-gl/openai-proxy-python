@@ -6,6 +6,7 @@ import os
 import asyncio
 import random
 import copy
+import time
 from fastapi import Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.background import BackgroundTask
@@ -124,8 +125,7 @@ class BaseAPIProxy:
             # Log streaming request body and cookies
             if body:
                 try:
-                    sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
-                    body_json = json.dumps(sanitized_body)
+                    body_json = json.dumps(body)
                     self.logger.debug(f"Streaming request body {request_id}: {body_json}")
                     
                     # Log current cookies
@@ -151,18 +151,33 @@ class BaseAPIProxy:
                 # Log response details including rate limits
                 status_code, response_headers = await log_response(response, request_id, True)
                 
+                # For 429 responses, get the full error message
                 if status_code == 429:
-                    error_msg = json.dumps({
-                        "error": {
-                            "message": "Rate limit exceeded",
-                            "type": "rate_limit_error",
-                            "headers": {k: v for k, v in response_headers.items() if 'ratelimit' in k.lower()}
+                    self.logger.warning(f"Rate limit exceeded for request {request_id}")
+                    try:
+                        # Read the full response body for error details
+                        error_body = await response.json()
+                        self.logger.error(f"Rate limit error details: {json.dumps(error_body, indent=2)}")
+                        
+                        # Create a proper error response
+                        return JSONResponse(
+                            status_code=429,
+                            content=error_body
+                        )
+                    except Exception as e:
+                        self.logger.error(f"Failed to parse rate limit error: {str(e)}")
+                        # Fallback error message
+                        error_msg = {
+                            "error": {
+                                "message": f"Rate limit exceeded. Check API key limits: {str(e)}",
+                                "type": "rate_limit_error",
+                                "headers": {k: v for k, v in response_headers.items() if 'ratelimit' in k.lower()}
+                            }
                         }
-                    })
-                    return JSONResponse(
-                        status_code=429,
-                        content=json.loads(error_msg)
-                    )
+                        return JSONResponse(
+                            status_code=429,
+                            content=error_msg
+                        )
                 
                 # Extract and update cookies from response
                 if "set-cookie" in response.headers:
@@ -232,6 +247,10 @@ class OpenAIProxy(BaseAPIProxy):
             "openai-api.argoapis.com",
             "open-api.ringcredible.com",
         ]
+        
+        # Rate limit retry settings
+        self.max_retries = 3
+        self.base_retry_delay = 1.0  # Initial delay in seconds
     
     async def forward_request(self, request: Request, path: str, request_id: str = None):
         """Forward request to OpenAI API"""
@@ -407,114 +426,101 @@ class OpenAIProxy(BaseAPIProxy):
                 self.logger.debug(f"Handling streaming request to {target_url}")
             return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id, self._log_response)
             
-        # Regular API call
+        # Regular API call - try with automatic retry for rate limits
         try:
-            # Log the client creation attempt
-            if debug_mode:
-                self.logger.debug(f"Creating HTTP client for request to {target_url}")
+            # Check if rate limit retry is enabled
+            use_rate_limit_retry = True  # You can make this configurable
+            
+            if use_rate_limit_retry:
+                response_or_error = await self._handle_rate_limit_retry(request, method, target_url, headers, body, request_id, path)
                 
-            # Adjust timeout based on debug mode - shorter for tests, longer for real usage
-            timeout_seconds = 60.0 if debug_mode else 300.0
-            if debug_mode:
-                self.logger.debug(f"Using timeout of {timeout_seconds} seconds for debug mode")
-                
-            # Simplify the client configuration for reliability
-            async with httpx.AsyncClient(
-                timeout=timeout_seconds,  # Shorter timeout in debug mode
-                verify=True,    # Use system certificates for verification
-                follow_redirects=True,
-                headers=headers,
-            ) as client:
-                # Handle regular responses - pass full URL directly
-                self.logger.info(f"Sending request to: {target_url}")
-                if debug_mode:
-                    self.logger.debug(f"Request body to OpenAI: {json.dumps(body)}")
+                # If we got a JSONResponse (error case), return it directly
+                if isinstance(response_or_error, JSONResponse):
+                    return response_or_error
                     
-                # Make the actual request
-                response = await client.request(
-                    method=method,
-                    url=target_url,  # Use full target URL to ensure proper SNI
+                # Otherwise, we got a valid response
+                response = response_or_error
+            else:
+                # Original code for non-retry path
+                async with httpx.AsyncClient(
+                    timeout=60.0,
+                    verify=True,
+                    follow_redirects=True,
                     headers=headers,
-                    json=body if method in ("POST", "PUT", "PATCH") else None,
-                    params=request.query_params,
-                )
-                
-                # Get response data
-                status_code = response.status_code
-                response_headers = dict(response.headers)
-                
-                if debug_mode:
-                    self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
-                    # Log response body in debug mode
-                    try:
-                        response_body = response.json()
-                        # Create a sanitized version for logging
-                        sanitized_response = copy.deepcopy(response_body) if isinstance(response_body, dict) else response_body
-                        # Redact sensitive fields in response
-                        if isinstance(sanitized_response, dict):
-                            # Redact any potential sensitive data in response messages
-                            if "choices" in sanitized_response:
-                                for choice in sanitized_response["choices"]:
-                                    if isinstance(choice, dict) and "message" in choice:
-                                        if isinstance(choice["message"], dict) and "content" in choice["message"]:
-                                            choice["message"]["content"] = "[CONTENT REDACTED FOR PRIVACY]"
-                        response_json = json.dumps(sanitized_response)
-                        response_json = redact_api_key(response_json)
-                        self.logger.debug(f"Response body {request_id}: {response_json}")
-                    except Exception as e:
-                        self.logger.debug(f"Could not log response body {request_id}: {str(e)}")
-                
-                # Extract cookies from response and update our cookie jar
-                if "set-cookie" in response_headers:
-                    self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
-                    self.client.cookies.extract_cookies(response)
-                    
-                    # Share cookies with streaming client for future requests
-                    for cookie in self.client.cookies.jar:
-                        self.streaming_client.cookies.set(
-                            cookie.name, 
-                            cookie.value, 
-                            domain=cookie.domain, 
-                            path=cookie.path
-                        )
-                
-                # Remove content-encoding to prevent decoding issues
-                if "content-encoding" in response_headers:
-                    del response_headers["content-encoding"]
-                
-                # Pass through binary response by default
+                ) as client:
+                    response = await client.request(
+                        method=method,
+                        url=target_url,
+                        headers=headers,
+                        json=body if method in ("POST", "PUT", "PATCH") else None,
+                        params=request.query_params,
+                    )
+            
+            # Process the response
+            status_code = response.status_code
+            response_headers = dict(response.headers)
+            
+            if debug_mode:
+                self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
+                # Log response body in debug mode
                 try:
                     response_body = response.json()
-                    if debug_mode:
-                        self.logger.debug(f"Response body: {json.dumps(response_body)}")
-                    self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                    # Add CORS and private network headers
-                    response_headers.update({
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                        "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                        "Access-Control-Allow-Private-Network": "true",
-                        "Access-Control-Expose-Headers": "*"
-                    })
-                    return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                except Exception as json_error:
-                    # Just return the raw response content with the modified headers
-                    if debug_mode:
-                        self.logger.debug(f"Non-JSON response, returning raw content: {str(json_error)}")
-                    self.request_logger.log_response(
-                        request_id, 
-                        status_code, 
-                        response_headers, 
-                        {"binary": True, "length": len(response.content)}
+                    response_json = json.dumps(response_body)
+                    self.logger.debug(f"Response body {request_id}: {response_json}")
+                except Exception as e:
+                    self.logger.debug(f"Could not log response body {request_id}: {str(e)}")
+            
+            # Extract cookies from response and update our cookie jar
+            if "set-cookie" in response_headers:
+                self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
+                self.client.cookies.extract_cookies(response)
+                
+                # Share cookies with streaming client for future requests
+                for cookie in self.client.cookies.jar:
+                    self.streaming_client.cookies.set(
+                        cookie.name, 
+                        cookie.value, 
+                        domain=cookie.domain, 
+                        path=cookie.path
                     )
-                    # Ensure Content-Length is set correctly
-                    response_headers["content-length"] = str(len(response.content))
-                    return Response(
-                        content=response.content,
-                        status_code=status_code, 
-                        headers=response_headers,
-                        media_type=response_headers.get("content-type", "application/json")
-                    )
+            
+            # Remove content-encoding to prevent decoding issues
+            if "content-encoding" in response_headers:
+                del response_headers["content-encoding"]
+            
+            # Pass through binary response by default
+            try:
+                response_body = response.json()
+                if debug_mode:
+                    self.logger.debug(f"Response body: {json.dumps(response_body)}")
+                self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                # Add CORS and private network headers
+                response_headers.update({
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                    "Access-Control-Allow-Private-Network": "true",
+                    "Access-Control-Expose-Headers": "*"
+                })
+                return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+            except Exception as json_error:
+                # Just return the raw response content with the modified headers
+                if debug_mode:
+                    self.logger.debug(f"Non-JSON response, returning raw content: {str(json_error)}")
+                self.request_logger.log_response(
+                    request_id, 
+                    status_code, 
+                    response_headers, 
+                    {"binary": True, "length": len(response.content)}
+                )
+                # Ensure Content-Length is set correctly
+                response_headers["content-length"] = str(len(response.content))
+                return Response(
+                    content=response.content,
+                    status_code=status_code, 
+                    headers=response_headers,
+                    media_type=response_headers.get("content-type", "application/json")
+                )
         except Exception as e:
             self.logger.error(f"Error creating client or making request: {str(e)}")
             if debug_mode:
@@ -751,10 +757,105 @@ class OpenAIProxy(BaseAPIProxy):
             try:
                 error_body = await response.json()
                 self.logger.debug(f"Error response body for {request_id}: {json.dumps(error_body, indent=2)}")
+                
+                # For rate limit errors, log at error level
+                if status_code == 429:
+                    self.logger.error(f"Rate limit exceeded for {request_id}: {json.dumps(error_body, indent=2)}")
+                    
+                    # Look for specific rate limit info in the error message
+                    if isinstance(error_body, dict) and 'error' in error_body:
+                        error_message = error_body['error'].get('message', '')
+                        self.logger.error(f"Rate limit reason: {error_message}")
+                        
+                        # Log suggestions based on error message
+                        if 'tokens per min' in error_message.lower():
+                            self.logger.error("Consider waiting or implementing token rate limiting")
+                        elif 'requests per min' in error_message.lower():
+                            self.logger.error("Consider waiting or implementing request rate limiting")
+                        elif 'organization' in error_message.lower() and 'quota' in error_message.lower():
+                            self.logger.error("Organization quota exceeded. Consider upgrading your plan.")
+                
             except Exception as e:
                 self.logger.debug(f"Could not parse error response body for {request_id}: {str(e)}")
         
         return status_code, response_headers
+
+    async def _handle_rate_limit_retry(self, request, method, target_url, headers, body, request_id, path):
+        """Handle rate-limited requests with exponential backoff retries"""
+        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+        retries = 0
+        
+        while retries < self.max_retries:
+            try:
+                # Make the request
+                async with httpx.AsyncClient(
+                    timeout=60.0,
+                    verify=True,
+                    follow_redirects=True,
+                    headers=headers,
+                ) as client:
+                    self.logger.info(f"Attempting request {request_id} (attempt {retries+1}/{self.max_retries})")
+                    response = await client.request(
+                        method=method,
+                        url=target_url,
+                        headers=headers,
+                        json=body if method in ("POST", "PUT", "PATCH") else None,
+                        params=request.query_params,
+                    )
+                    
+                    # If not rate limited, return the response
+                    if response.status_code != 429:
+                        return response
+                    
+                    # Extract rate limit reset time if available
+                    reset_time = None
+                    for header_name in response.headers:
+                        if 'x-ratelimit-reset' in header_name.lower():
+                            try:
+                                reset_time = float(response.headers[header_name])
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Calculate backoff delay
+                    if reset_time and reset_time > 0:
+                        # Use the reset time from the headers if available
+                        delay = reset_time + 0.5  # Add a small buffer
+                    else:
+                        # Exponential backoff with jitter
+                        delay = self.base_retry_delay * (2 ** retries) * (0.5 + random.random())
+                        
+                    if debug_mode:
+                        self.logger.debug(f"Rate limited. Retrying in {delay:.2f} seconds (attempt {retries+1}/{self.max_retries})")
+                    
+                    # Wait before retrying
+                    await asyncio.sleep(delay)
+                    retries += 1
+                    
+            except Exception as e:
+                self.logger.error(f"Error during retry attempt {retries+1}: {str(e)}")
+                retries += 1
+                # Use a simple backoff for connection errors
+                await asyncio.sleep(self.base_retry_delay * (2 ** retries))
+        
+        # If we've exhausted retries, return the last error response
+        self.logger.error(f"Rate limit persisted after {self.max_retries} retries for {request_id}")
+        
+        # Create a custom error response with detailed information
+        error_response = {
+            "error": {
+                "message": f"Rate limit persisted after {self.max_retries} retries. Please check your API key's rate limits.",
+                "type": "rate_limit_error",
+                "request_id": request_id,
+                "path": path,
+                "code": 429
+            }
+        }
+        
+        return JSONResponse(
+            status_code=429,
+            content=error_response
+        )
 
 class AnthropicProxy(BaseAPIProxy):
     """Proxy for Anthropic API requests"""
@@ -763,6 +864,10 @@ class AnthropicProxy(BaseAPIProxy):
         super().__init__(settings)
         self.base_url = settings.anthropic_base_url
         self.headers = settings.get_anthropic_headers()
+        
+        # Rate limit retry settings
+        self.max_retries = 3  
+        self.base_retry_delay = 1.0  # Initial delay in seconds
     
     async def forward_request(self, request: Request, path: str, request_id: str = None):
         """Forward request to Anthropic API"""
@@ -938,112 +1043,101 @@ class AnthropicProxy(BaseAPIProxy):
                 self.logger.debug(f"Handling Anthropic streaming request to {target_url}")
             return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id, self._log_response)
         
-        # Regular API call
+        # Regular API call - try with automatic retry for rate limits
         try:
-            # Log the client creation attempt
-            if debug_mode:
-                self.logger.debug(f"Creating HTTP client for Anthropic request to {target_url}")
+            # Check if rate limit retry is enabled
+            use_rate_limit_retry = True  # You can make this configurable
+            
+            if use_rate_limit_retry:
+                response_or_error = await self._handle_rate_limit_retry(request, method, target_url, headers, body, request_id, path)
                 
-            # Adjust timeout based on debug mode - shorter for tests, longer for real usage
-            timeout_seconds = 60.0 if debug_mode else 300.0
-            if debug_mode:
-                self.logger.debug(f"Using timeout of {timeout_seconds} seconds for debug mode")
-                
-            # Simplify the client configuration for reliability
-            async with httpx.AsyncClient(
-                timeout=timeout_seconds,  # Shorter timeout in debug mode
-                verify=True,    # Use system certificates for verification
-                follow_redirects=True,
-                headers=headers,
-            ) as client:
-                # Handle streaming responses
-                if body and body.get("stream", False):
-                    return await self._handle_streaming_request(client, method, target_url, headers, body, request_id, self._log_response)
-                
-                try:
-                    # Handle regular responses - pass full URL directly
-                    self.logger.info(f"Sending request to: {target_url}")
-                    if debug_mode:
-                        self.logger.debug(f"Request body to Anthropic: {json.dumps(body)}")
-                        
-                    # Make the actual request
+                # If we got a JSONResponse (error case), return it directly
+                if isinstance(response_or_error, JSONResponse):
+                    return response_or_error
+                    
+                # Otherwise, we got a valid response
+                response = response_or_error
+            else:
+                # Original code for non-retry path
+                async with httpx.AsyncClient(
+                    timeout=60.0,
+                    verify=True,
+                    follow_redirects=True,
+                    headers=headers,
+                ) as client:
                     response = await client.request(
                         method=method,
-                        url=target_url,  # Use full target URL to ensure proper SNI
+                        url=target_url,
                         headers=headers,
                         json=body if method in ("POST", "PUT", "PATCH") else None,
                         params=request.query_params,
                     )
-                    
-                    # Get response data
-                    status_code = response.status_code
-                    response_headers = dict(response.headers)
-                    
-                    if debug_mode:
-                        self.logger.debug(f"Anthropic response received: status={status_code}, headers={response_headers}")
-                    
-                    # Extract cookies from response and update our cookie jar
-                    if "set-cookie" in response_headers:
-                        self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
-                        self.client.cookies.extract_cookies(response)
-                        
-                        # Share cookies with streaming client for future requests
-                        for cookie in self.client.cookies.jar:
-                            self.streaming_client.cookies.set(
-                                cookie.name, 
-                                cookie.value, 
-                                domain=cookie.domain, 
-                                path=cookie.path
-                            )
-                    
-                    # Remove content-encoding to prevent decoding issues
-                    if "content-encoding" in response_headers:
-                        del response_headers["content-encoding"]
-                    
-                    # Pass through binary response by default
-                    try:
-                        response_body = response.json()
-                        if debug_mode:
-                            self.logger.debug(f"Anthropic response body: {json.dumps(response_body)}")
-                        self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                        # Add CORS and private network headers
-                        response_headers.update({
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                            "Access-Control-Allow-Private-Network": "true",
-                            "Access-Control-Expose-Headers": "*"
-                        })
-                        return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                    except Exception as json_error:
-                        # Just return the raw response content with the modified headers
-                        if debug_mode:
-                            self.logger.debug(f"Non-JSON Anthropic response, returning raw content: {str(json_error)}")
-                        self.request_logger.log_response(
-                            request_id, 
-                            status_code, 
-                            response_headers, 
-                            {"binary": True, "length": len(response.content)}
-                        )
-                        # Ensure Content-Length is set correctly
-                        response_headers["content-length"] = str(len(response.content))
-                        return Response(
-                            content=response.content,
-                            status_code=status_code, 
-                            headers=response_headers,
-                            media_type=response_headers.get("content-type", "application/json")
-                        )
+            
+            # Process the response
+            status_code = response.status_code
+            response_headers = dict(response.headers)
+            
+            if debug_mode:
+                self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
+                # Log response body in debug mode
+                try:
+                    response_body = response.json()
+                    response_json = json.dumps(response_body)
+                    self.logger.debug(f"Response body {request_id}: {response_json}")
                 except Exception as e:
-                    self.logger.error(f"Error making request to Anthropic API: {str(e)}")
-                    if debug_mode:
-                        self.logger.debug(f"Detailed Anthropic error: {type(e).__name__}: {str(e)}")
-                    error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(e)}", "type": "proxy_error"}}
-                    error_json = json.dumps(error_content).encode('utf-8')
-                    return SafeJSONResponse(
-                        status_code=500,
-                        content=error_content,
-                        headers={"Content-Length": str(len(error_json))}
+                    self.logger.debug(f"Could not log response body {request_id}: {str(e)}")
+            
+            # Extract cookies from response and update our cookie jar
+            if "set-cookie" in response_headers:
+                self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
+                self.client.cookies.extract_cookies(response)
+                
+                # Share cookies with streaming client for future requests
+                for cookie in self.client.cookies.jar:
+                    self.streaming_client.cookies.set(
+                        cookie.name, 
+                        cookie.value, 
+                        domain=cookie.domain, 
+                        path=cookie.path
                     )
+            
+            # Remove content-encoding to prevent decoding issues
+            if "content-encoding" in response_headers:
+                del response_headers["content-encoding"]
+            
+            # Pass through binary response by default
+            try:
+                response_body = response.json()
+                if debug_mode:
+                    self.logger.debug(f"Response body: {json.dumps(response_body)}")
+                self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                # Add CORS and private network headers
+                response_headers.update({
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                    "Access-Control-Allow-Private-Network": "true",
+                    "Access-Control-Expose-Headers": "*"
+                })
+                return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+            except Exception as json_error:
+                # Just return the raw response content with the modified headers
+                if debug_mode:
+                    self.logger.debug(f"Non-JSON response, returning raw content: {str(json_error)}")
+                self.request_logger.log_response(
+                    request_id, 
+                    status_code, 
+                    response_headers, 
+                    {"binary": True, "length": len(response.content)}
+                )
+                # Ensure Content-Length is set correctly
+                response_headers["content-length"] = str(len(response.content))
+                return Response(
+                    content=response.content,
+                    status_code=status_code, 
+                    headers=response_headers,
+                    media_type=response_headers.get("content-type", "application/json")
+                )
         except Exception as e:
             self.logger.error(f"Error creating client or making request: {str(e)}")
             if debug_mode:
@@ -1238,4 +1332,81 @@ class AnthropicProxy(BaseAPIProxy):
             mock_stream_generator(),
             media_type="text/event-stream",
             headers=headers
+        )
+
+    async def _handle_rate_limit_retry(self, request, method, target_url, headers, body, request_id, path):
+        """Handle rate-limited requests with exponential backoff retries"""
+        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+        retries = 0
+        
+        while retries < self.max_retries:
+            try:
+                # Make the request
+                async with httpx.AsyncClient(
+                    timeout=60.0,
+                    verify=True,
+                    follow_redirects=True,
+                    headers=headers,
+                ) as client:
+                    self.logger.info(f"Attempting request {request_id} (attempt {retries+1}/{self.max_retries})")
+                    response = await client.request(
+                        method=method,
+                        url=target_url,
+                        headers=headers,
+                        json=body if method in ("POST", "PUT", "PATCH") else None,
+                        params=request.query_params,
+                    )
+                    
+                    # If not rate limited, return the response
+                    if response.status_code != 429:
+                        return response
+                    
+                    # Extract rate limit reset time if available
+                    reset_time = None
+                    for header_name in response.headers:
+                        if 'x-ratelimit-reset' in header_name.lower():
+                            try:
+                                reset_time = float(response.headers[header_name])
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Calculate backoff delay
+                    if reset_time and reset_time > 0:
+                        # Use the reset time from the headers if available
+                        delay = reset_time + 0.5  # Add a small buffer
+                    else:
+                        # Exponential backoff with jitter
+                        delay = self.base_retry_delay * (2 ** retries) * (0.5 + random.random())
+                        
+                    if debug_mode:
+                        self.logger.debug(f"Rate limited. Retrying in {delay:.2f} seconds (attempt {retries+1}/{self.max_retries})")
+                    
+                    # Wait before retrying
+                    await asyncio.sleep(delay)
+                    retries += 1
+                    
+            except Exception as e:
+                self.logger.error(f"Error during retry attempt {retries+1}: {str(e)}")
+                retries += 1
+                # Use a simple backoff for connection errors
+                await asyncio.sleep(self.base_retry_delay * (2 ** retries))
+        
+        # If we've exhausted retries, return the last error response
+        self.logger.error(f"Rate limit persisted after {self.max_retries} retries for {request_id}")
+        
+        # Create a custom error response with detailed information
+        error_response = {
+            "error": {
+                "message": f"Rate limit persisted after {self.max_retries} retries. Please check your API key's rate limits.",
+                "type": "rate_limit_error",
+                "request_id": request_id,
+                "path": path,
+                "code": 429
+            }
+        }
+        
+        return JSONResponse(
+            status_code=429,
+            content=error_response
         ) 
