@@ -52,9 +52,23 @@ async def test_streaming_content_length_handling(proxy):
         yield b'data: {"id":"chatcmpl-123","object":"chat.completion.chunk"}\n\n'
         yield b'data: [DONE]\n\n'
 
+    # Add streaming headers including Transfer-Encoding: chunked
+    streaming_headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Transfer-Encoding": "chunked",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*"
+    }
+
     proxy._handle_streaming_request = AsyncMock(return_value=StreamingResponse(
         content=mock_stream_generator(),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers=streaming_headers
     ))
 
     # Mock security filter to return allowed=True

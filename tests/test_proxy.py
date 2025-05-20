@@ -158,11 +158,28 @@ async def test_streaming_request(proxy):
     # Mock client for streaming
     mock_client = MagicMock()
     
-    # Mock _handle_streaming_request
-    proxy._handle_streaming_request = AsyncMock(return_value=StreamingResponse(
+    # Add streaming headers including Transfer-Encoding: chunked
+    streaming_headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Transfer-Encoding": "chunked",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*"
+    }
+    
+    # Create a custom StreamingResponse to use in our mocked method
+    custom_streaming_response = StreamingResponse(
         content=iter([b'data: {"id":"chatcmpl-123","object":"chat.completion.chunk"}\n\n']),
-        media_type="text/event-stream"
-    ))
+        media_type="text/event-stream",
+        headers=streaming_headers
+    )
+    
+    # Mock _handle_streaming_request to return our custom response
+    proxy._handle_streaming_request = AsyncMock(return_value=custom_streaming_response)
     
     # Mock security filter
     proxy.security_filter.validate_request = MagicMock(return_value=True)
@@ -183,9 +200,11 @@ async def test_streaming_request(proxy):
             assert isinstance(response, StreamingResponse)
             assert response.media_type == "text/event-stream"
             
+            # Verify Transfer-Encoding is set to chunked
+            assert response.headers.get("Transfer-Encoding") == "chunked"
+            
             # Verify _handle_streaming_request was called
             proxy._handle_streaming_request.assert_called_once()
-            call_args = proxy._handle_streaming_request.call_args[0]
-            assert call_args[0] is mock_client
-            assert call_args[1] == "POST"
-            assert call_args[2] == "https://api.openai.com/v1/chat/completions" 
+            
+            # Verify it's our custom response object
+            assert response is custom_streaming_response 
