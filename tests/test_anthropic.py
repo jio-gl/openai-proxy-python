@@ -4,7 +4,7 @@ import os
 import time
 
 # Firewall proxy URL (local server)
-PROXY_URL = "http://localhost:8000"
+PROXY_URL = "http://localhost:8001"
 
 def test_anthropic_completion():
     """Test a simple message completion request through the firewall"""

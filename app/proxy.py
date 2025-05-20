@@ -5,12 +5,13 @@ import uuid
 import os
 import asyncio
 import random
+import copy
 from fastapi import Request, Response, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 from app.config import Settings
-from app.logging import RequestResponseLogger
+from app.logging import RequestResponseLogger, redact_api_key
 from app.security import SecurityFilter
 
 # Create a custom JSONResponse that always sets a proper content-length header
@@ -278,68 +279,55 @@ class OpenAIProxy(BaseAPIProxy):
             try:
                 # Log the request reading to help diagnose issues
                 if debug_mode:
-                    self.logger.debug(f"Attempting to read request body for {request_id}")
-                
-                # Get the request body with retries in case of issues
-                # FastAPI should cache the body, but let's be extra careful in debug mode
-                max_retries = 3 if debug_mode else 1
-                body_bytes = None
-                retry_count = 0
-                last_error = None
-                
-                # Try to read the body multiple times if needed
-                while retry_count < max_retries and not body_bytes:
-                    try:
-                        # Attempt to read the body
-                        body_bytes = await request.body()
-                        if debug_mode:
-                            self.logger.debug(f"Successfully read request body: {len(body_bytes)} bytes on try {retry_count+1}")
-                    except Exception as e:
-                        last_error = e
-                        retry_count += 1
-                        if debug_mode:
-                            self.logger.debug(f"Retry {retry_count}/{max_retries} reading body: {str(e)}")
-                        # Wait a bit before retrying
-                        await asyncio.sleep(0.1)
-                
-                # If we still couldn't read the body after retries
-                if not body_bytes and last_error:
-                    raise last_error
-                
-                # If body is empty and it's a required method, that's an error
+                    self.logger.debug(f"Reading request body for {request_id}")
+
+                # Don't use retries - they may be causing issues
+                # Instead, just read the body cleanly once with proper error handling
+                body_bytes = await request.body()
                 if not body_bytes:
-                    self.logger.error(f"Empty request body for {method} request")
-                    self.request_logger.log_request(request_id, method, path, headers, {})
+                    self.logger.warning(f"Empty request body for {method} request")
+                    empty_obj = {}
+                    self.request_logger.log_request(request_id, method, path, headers, empty_obj)
                     return SafeJSONResponse(
                         status_code=400,
                         content={"error": {"message": "Empty request body", "type": "invalid_request_error"}}
                     )
-                    
+
                 # Parse the JSON
-                body = json.loads(body_bytes)
-                self.request_logger.log_request(request_id, method, path, headers, body)
-            except json.JSONDecodeError as e:
-                self.logger.error(f"Error parsing request body JSON: {str(e)}")
-                if debug_mode:
-                    self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
-                self.request_logger.log_request(request_id, method, path, headers, {})
-                return SafeJSONResponse(
-                    status_code=400,
-                    content={"error": {"message": f"Invalid JSON in request body: {str(e)}", "type": "invalid_request_error"}}
-                )
+                try:
+                    body = json.loads(body_bytes)
+                    if debug_mode:
+                        # Create a sanitized version for logging
+                        sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
+                        # Redact sensitive fields
+                        if isinstance(sanitized_body, dict):
+                            if "api_key" in sanitized_body:
+                                sanitized_body["api_key"] = "[REDACTED]"
+                        # Log the sanitized body
+                        body_json = json.dumps(sanitized_body)
+                        body_json = redact_api_key(body_json)
+                        self.logger.debug(f"Request body {request_id}: {body_json}")
+                    
+                    # Log the request
+                    self.request_logger.log_request(request_id, method, path, headers, body)
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Invalid JSON in request body: {str(e)}")
+                    return SafeJSONResponse(
+                        status_code=400,
+                        content={"error": {"message": f"Invalid JSON: {str(e)}", "type": "invalid_request_error"}}
+                    )
             except Exception as e:
                 self.logger.error(f"Error reading request body: {str(e)}")
                 if debug_mode:
                     self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
-                empty_body = {}
-                self.request_logger.log_request(request_id, method, path, headers, empty_body)
                 return SafeJSONResponse(
                     status_code=400,
-                    content={"error": {"message": f"Error processing request body: {str(e)}", "type": "invalid_request_error"}}
+                    content={"error": {"message": f"Error processing request: {str(e)}", "type": "request_error"}}
                 )
         else:
+            # For non-body methods
             body = {}
-        self.request_logger.log_request(request_id, method, path, headers, body)
+            self.request_logger.log_request(request_id, method, path, headers, body)
         
         # If in mock mode, return mock response
         if self.mock_mode:
@@ -737,64 +725,50 @@ class AnthropicProxy(BaseAPIProxy):
             try:
                 # Log the request reading to help diagnose issues
                 if debug_mode:
-                    self.logger.debug(f"Attempting to read Anthropic request body for {request_id}")
-                
-                # Get the request body with retries in case of issues
-                # FastAPI should cache the body, but let's be extra careful in debug mode
-                max_retries = 3 if debug_mode else 1
-                body_bytes = None
-                retry_count = 0
-                last_error = None
-                
-                # Try to read the body multiple times if needed
-                while retry_count < max_retries and not body_bytes:
-                    try:
-                        # Attempt to read the body
-                        body_bytes = await request.body()
-                        if debug_mode:
-                            self.logger.debug(f"Successfully read Anthropic request body: {len(body_bytes)} bytes on try {retry_count+1}")
-                    except Exception as e:
-                        last_error = e
-                        retry_count += 1
-                        if debug_mode:
-                            self.logger.debug(f"Retry {retry_count}/{max_retries} reading body: {str(e)}")
-                        # Wait a bit before retrying
-                        await asyncio.sleep(0.1)
-                
-                # If we still couldn't read the body after retries
-                if not body_bytes and last_error:
-                    raise last_error
-                
-                # If body is empty and it's a required method, that's an error
+                    self.logger.debug(f"Reading Anthropic request body for {request_id}")
+
+                # Don't use retries - they may be causing issues
+                # Instead, just read the body cleanly once with proper error handling
+                body_bytes = await request.body()
                 if not body_bytes:
-                    self.logger.error(f"Empty request body for {method} request")
-                    self.request_logger.log_request(request_id, method, path, headers, {})
+                    self.logger.warning(f"Empty Anthropic request body for {method} request")
+                    empty_obj = {}
+                    self.request_logger.log_request(request_id, method, path, headers, empty_obj)
                     return SafeJSONResponse(
                         status_code=400,
                         content={"error": {"message": "Empty request body", "type": "invalid_request_error"}}
                     )
-                    
+
                 # Parse the JSON
-                body = json.loads(body_bytes)
-                self.request_logger.log_request(request_id, method, path, headers, body)
-            except json.JSONDecodeError as e:
-                self.logger.error(f"Error parsing request body JSON: {str(e)}")
-                if debug_mode:
-                    self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
-                self.request_logger.log_request(request_id, method, path, headers, {})
-                return SafeJSONResponse(
-                    status_code=400,
-                    content={"error": {"message": f"Invalid JSON in request body: {str(e)}", "type": "invalid_request_error"}}
-                )
+                try:
+                    body = json.loads(body_bytes)
+                    if debug_mode:
+                        # Create a sanitized version for logging
+                        sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
+                        # Redact sensitive fields
+                        if isinstance(sanitized_body, dict):
+                            if "api_key" in sanitized_body:
+                                sanitized_body["api_key"] = "[REDACTED]"
+                        # Log the sanitized body
+                        body_json = json.dumps(sanitized_body)
+                        body_json = redact_api_key(body_json)
+                        self.logger.debug(f"Anthropic request body {request_id}: {body_json}")
+                    
+                    # Log the request
+                    self.request_logger.log_request(request_id, method, path, headers, body)
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Invalid JSON in Anthropic request body: {str(e)}")
+                    return SafeJSONResponse(
+                        status_code=400,
+                        content={"error": {"message": f"Invalid JSON: {str(e)}", "type": "invalid_request_error"}}
+                    )
             except Exception as e:
-                self.logger.error(f"Error reading request body: {str(e)}")
+                self.logger.error(f"Error reading Anthropic request body: {str(e)}")
                 if debug_mode:
-                    self.logger.debug(f"Request body error details: {type(e).__name__}: {str(e)}")
-                empty_body = {}
-                self.request_logger.log_request(request_id, method, path, headers, empty_body)
+                    self.logger.debug(f"Anthropic request body error details: {type(e).__name__}: {str(e)}")
                 return SafeJSONResponse(
                     status_code=400,
-                    content={"error": {"message": f"Error processing request body: {str(e)}", "type": "invalid_request_error"}}
+                    content={"error": {"message": f"Error processing request: {str(e)}", "type": "request_error"}}
                 )
         else:
             body = {}

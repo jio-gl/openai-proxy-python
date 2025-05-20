@@ -5,7 +5,7 @@ import sseclient
 import time
 
 # Firewall proxy URL (local server)
-PROXY_URL = "http://localhost:8000"
+PROXY_URL = "http://localhost:8001"
 
 def test_anthropic_streaming():
     """Test a streaming message request through the Anthropic API firewall"""

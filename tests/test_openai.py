@@ -6,9 +6,9 @@ import socket
 import time
 
 # Firewall proxy URL (local server)
-PROXY_URL = "http://localhost:8000"
+PROXY_URL = "http://localhost:8001"
 
-def is_server_running(host="localhost", port=8000):
+def is_server_running(host="localhost", port=8001):
     """Check if the server is running on the specified port"""
     try:
         # Create a socket and try to connect
@@ -19,7 +19,7 @@ def is_server_running(host="localhost", port=8000):
     except:
         return False
 
-@pytest.mark.skipif(not is_server_running(), reason="Server not running on port 8000")
+@pytest.mark.skipif(not is_server_running(), reason="Server not running on port 8001")
 def test_openai_completion():
     """Test a simple chat completion request through the firewall"""
     url = f"{PROXY_URL}/v1/chat/completions"
@@ -95,4 +95,4 @@ if __name__ == "__main__":
     if is_server_running():
         test_openai_completion()
     else:
-        print("Server not running on port 8000. Start the server before running this test.") 
+        print("Server not running on port 8001. Start the server before running this test.") 

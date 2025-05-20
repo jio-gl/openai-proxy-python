@@ -51,7 +51,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         # In debug mode, log more details of the request
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
         
-        # Create a copy of the request body for logging without consuming it for processing
+        # Only log detailed information in debug mode
         if debug_mode:
             try:
                 # Log sanitized headers
@@ -64,47 +64,18 @@ class LoggingMiddleware(BaseHTTPMiddleware):
                 
                 logger.debug(f"Request headers {request_id}: {headers_dict}")
                 
-                # Only attempt to log the body for JSON content
-                if (request.method in ("POST", "PUT", "PATCH") and 
-                    request.headers.get("Content-Type", "").startswith("application/json")):
-                    
-                    # Important: create a safe copy of the body to avoid affecting the original request
-                    # FastAPI's Request class has the ability to "cache" the body
-                    try:
-                        # Peek at the body without consuming it from downstream handlers
-                        # This uses FastAPI's built-in caching mechanism
-                        body_bytes = await request.body()
-                        body_size = len(body_bytes)
-                        
-                        # Only log if we successfully got the body
-                        if body_bytes:
-                            try:
-                                # Limit to 1MB for logging
-                                body_to_log = body_bytes[:1024*1024] if body_size > 1024*1024 else body_bytes
-                                body = json.loads(body_to_log)
-                                
-                                # Create sanitized copy for logging
-                                sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
-                                
-                                # Redact sensitive fields
-                                if isinstance(sanitized_body, dict):
-                                    if "api_key" in sanitized_body:
-                                        sanitized_body["api_key"] = "[REDACTED]"
-                                    
-                                # Convert to JSON and apply final redaction
-                                body_json = json.dumps(sanitized_body)
-                                body_json = redact_api_key(body_json)
-                                logger.debug(f"Request body {request_id}: {body_json}")
-                            except json.JSONDecodeError:
-                                logger.debug(f"Request body {request_id}: Could not parse JSON body")
-                            except Exception as e:
-                                logger.debug(f"Error processing request body: {str(e)}")
-                    except Exception as e:
-                        logger.debug(f"Error reading request body: {str(e)}")
+                # For JSON content types, we'll store the body bytes for logging,
+                # but we won't consume it here as that can interfere with downstream handlers
+                is_json_content = (request.method in ("POST", "PUT", "PATCH") and 
+                                  request.headers.get("Content-Type", "").startswith("application/json"))
+                
+                # Store original body for later - don't attempt to read it yet
+                # Pass the original request to downstream
             except Exception as e:
-                logger.debug(f"Error logging request details: {str(e)}")
+                logger.debug(f"Error logging request headers: {str(e)}")
         
-        # Process the request normally - the body should still be available
+        # Process the request normally
+        # Important: we don't touch the body before passing to the handler
         response = await call_next(request)
         
         # Log the response
