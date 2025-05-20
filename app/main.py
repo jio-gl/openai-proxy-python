@@ -141,8 +141,10 @@ async def log_requests(request: Request, call_next):
     logger.info(f"Request {request_id}: {request.method} {request.url.path}")
     
     # In debug mode, log more details of the request
-    original_body = None
-    if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG":
+    debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+    modified_request = request
+    
+    if debug_mode:
         try:
             # Log sanitized headers
             headers_dict = dict(request.headers)
@@ -154,58 +156,65 @@ async def log_requests(request: Request, call_next):
                 
             logger.debug(f"Request headers {request_id}: {headers_dict}")
             
-            # Try to get and log body for non-streaming requests
-            if request.headers.get("Content-Type") == "application/json":
-                # Store the original request body
-                body_bytes = await request.body()
-                if body_bytes:
-                    # Save the body so we can restore it
-                    original_body = body_bytes
-                    try:
-                        body = json.loads(body_bytes)
+            # Only try to capture the body for non-OPTIONS, non-GET requests with JSON content
+            if (request.method not in ("OPTIONS", "GET") and 
+                request.headers.get("Content-Type") == "application/json"):
+                try:
+                    # Create a copy of the request with a properly functioning body
+                    body_bytes = await request.body()
+                    
+                    # Only process if we have a body
+                    if body_bytes:
+                        try:
+                            body = json.loads(body_bytes)
+                            
+                            # Sanitize sensitive fields before logging
+                            sanitized_body = body.copy() if isinstance(body, dict) else body
+                            if isinstance(sanitized_body, dict):
+                                if "api_key" in sanitized_body:
+                                    sanitized_body["api_key"] = "[REDACTED]"
+                            
+                            # Convert to JSON and apply final redaction pass
+                            body_json = json.dumps(sanitized_body)
+                            body_json = redact_api_key(body_json)
+                            logger.debug(f"Request body {request_id}: {body_json}")
+                        except json.JSONDecodeError:
+                            logger.debug(f"Request body {request_id}: Could not parse JSON body")
                         
-                        # Sanitize sensitive fields before logging
-                        sanitized_body = body.copy() if isinstance(body, dict) else body
-                        if isinstance(sanitized_body, dict):
-                            if "api_key" in sanitized_body:
-                                sanitized_body["api_key"] = "[REDACTED]"
-                            if "messages" in sanitized_body and isinstance(sanitized_body["messages"], list):
-                                # Keep the structure but redact content if needed
-                                pass  # We're keeping content in debug mode
-                                
-                        # Convert to JSON and apply final redaction pass
-                        body_json = json.dumps(sanitized_body)
-                        body_json = redact_api_key(body_json)
-                        logger.debug(f"Request body {request_id}: {body_json}")
-                    except json.JSONDecodeError:
-                        logger.debug(f"Request body {request_id}: Could not parse JSON body")
+                        # Create a clone of the request with the body restored
+                        # This avoids the common FastAPI middleware body consumption issue
+                        class RequestBodyClone:
+                            async def __call__(self):
+                                return body_bytes
+                            
+                        # Update the request with the cloned body
+                        modified_request = Request(request.scope, request.receive)
+                        modified_request._body = body_bytes
+                        modified_request.body = RequestBodyClone()
+                except Exception as e:
+                    logger.debug(f"Error capturing request body: {str(e)}")
         except Exception as e:
             logger.debug(f"Error logging request details: {str(e)}")
     
-    # Restore the request body if needed
-    if original_body is not None:
-        # Replace the body getter to return our saved body
-        async def get_body():
-            return original_body
-        request._body = original_body
-        request.body = get_body
-    
-    # Process the request normally
-    response = await call_next(request)
+    # Process the request with the potentially modified request object
+    response = await call_next(modified_request)
     
     # Log the response without accessing its body
     logger.info(f"Response {request_id}: Status {response.status_code}")
     
     # In debug mode, try to log response headers
-    if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG":
-        # Redact any sensitive headers
-        response_headers = dict(response.headers)
-        if "authorization" in response_headers:
-            response_headers["authorization"] = "[REDACTED]"
-        if "x-api-key" in response_headers:
-            response_headers["x-api-key"] = "[REDACTED]"
-            
-        logger.debug(f"Response headers {request_id}: {response_headers}")
+    if debug_mode:
+        try:
+            # Redact any sensitive headers
+            response_headers = dict(response.headers)
+            if "authorization" in response_headers:
+                response_headers["authorization"] = "[REDACTED]"
+            if "x-api-key" in response_headers:
+                response_headers["x-api-key"] = "[REDACTED]"
+                
+            logger.debug(f"Response headers {request_id}: {response_headers}")
+        except Exception as e:
+            logger.debug(f"Error logging response headers: {str(e)}")
     
     # For streaming responses, ensure we don't modify Content-Length
     if response.headers.get("Content-Type") == "text/event-stream":
