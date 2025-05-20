@@ -78,6 +78,48 @@ class BaseAPIProxy:
         """Generate a mock response for testing"""
         raise NotImplementedError("Subclasses must implement this method")
     
+    async def _process_stream(self, response, request_id, debug_mode=False):
+        """Process a streaming response"""
+        try:
+            async with response:  # Ensure proper stream cleanup
+                async for chunk in response.aiter_bytes():
+                    if debug_mode:
+                        try:
+                            # Try to decode and parse the chunk for logging
+                            chunk_str = chunk.decode('utf-8')
+                            if chunk_str.startswith('data: '):
+                                chunk_data = chunk_str.replace('data: ', '')
+                                if chunk_data.strip() != '[DONE]':
+                                    try:
+                                        chunk_json = json.loads(chunk_data)
+                                        # Redact sensitive content in streaming response
+                                        if isinstance(chunk_json, dict) and 'choices' in chunk_json:
+                                            for choice in chunk_json['choices']:
+                                                if isinstance(choice, dict):
+                                                    if 'delta' in choice and isinstance(choice['delta'], dict):
+                                                        if 'content' in choice['delta']:
+                                                            choice['delta']['content'] = '[CONTENT REDACTED FOR PRIVACY]'
+                                        self.logger.debug(f"Streaming response chunk {request_id}: {json.dumps(chunk_json)}")
+                                    except json.JSONDecodeError:
+                                        pass  # Not all chunks are JSON
+                        except Exception as e:
+                            self.logger.debug(f"Could not log streaming chunk {request_id}: {str(e)}")
+                    yield chunk
+                # Ensure proper stream termination
+                yield b"data: [DONE]\n\n"
+        except httpx.StreamClosed as e:
+            self.logger.warning(f"Stream closed while processing {request_id}: {str(e)}")
+            # Return a graceful error message
+            error_msg = json.dumps({"error": {"message": "Stream was closed", "type": "stream_error"}})
+            yield f"data: {error_msg}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+        except Exception as e:
+            self.logger.error(f"Error processing stream {request_id}: {str(e)}")
+            # Return a graceful error message
+            error_msg = json.dumps({"error": {"message": str(e), "type": "stream_error"}})
+            yield f"data: {error_msg}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+
     async def _handle_streaming_request(self, client, method, target_url, headers, body, request_id):
         """Handle a streaming request"""
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
@@ -99,53 +141,61 @@ class BaseAPIProxy:
                 except Exception as e:
                     self.logger.debug(f"Could not log streaming request body {request_id}: {str(e)}")
         
+        # Create a copy of headers that's safe to modify
+        stream_headers = headers.copy()
+        
+        # Ensure proper streaming headers
+        stream_headers.update({
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked"
+        })
+        
+        # Remove any content-length header as it interferes with chunked encoding
+        stream_headers.pop("content-length", None)
+        
         try:
-            # Make the streaming request
+            # Make the streaming request with proper timeout settings
             async with client.stream(
                 method=method,
                 url=target_url,
-                headers=headers,
-                json=body if method in ("POST", "PUT", "PATCH") else None
+                headers=stream_headers,
+                json=body if method in ("POST", "PUT", "PATCH") else None,
+                timeout=httpx.Timeout(
+                    connect=10.0,    # Connection timeout
+                    read=None,       # No read timeout for streaming
+                    write=60.0,      # Write timeout
+                    pool=None        # No pool timeout
+                )
             ) as response:
-                # Create the streaming response
+                # Create the streaming response with proper headers
+                response_headers = {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Transfer-Encoding": "chunked",
+                    "X-Accel-Buffering": "no"  # Disable proxy buffering
+                }
+                
+                # Copy relevant headers from the upstream response
+                for header in ["access-control-allow-origin", "access-control-allow-methods",
+                             "access-control-allow-headers", "access-control-expose-headers"]:
+                    if header in response.headers:
+                        response_headers[header] = response.headers[header]
+                
                 return StreamingResponse(
                     self._process_stream(response, request_id, debug_mode),
                     status_code=response.status_code,
-                    headers=dict(response.headers)
+                    headers=response_headers
                 )
         except Exception as e:
             self.logger.error(f"Error in streaming request: {str(e)}")
-            raise
-
-    async def _process_stream(self, response, request_id, debug_mode=False):
-        """Process a streaming response"""
-        try:
-            async for chunk in response.aiter_bytes():
-                if debug_mode:
-                    try:
-                        # Try to decode and parse the chunk for logging
-                        chunk_str = chunk.decode('utf-8')
-                        if chunk_str.startswith('data: '):
-                            chunk_data = chunk_str.replace('data: ', '')
-                            if chunk_data.strip() != '[DONE]':
-                                try:
-                                    chunk_json = json.loads(chunk_data)
-                                    # Redact sensitive content in streaming response
-                                    if isinstance(chunk_json, dict) and 'choices' in chunk_json:
-                                        for choice in chunk_json['choices']:
-                                            if isinstance(choice, dict):
-                                                if 'delta' in choice and isinstance(choice['delta'], dict):
-                                                    if 'content' in choice['delta']:
-                                                        choice['delta']['content'] = '[CONTENT REDACTED FOR PRIVACY]'
-                                    self.logger.debug(f"Streaming response chunk {request_id}: {json.dumps(chunk_json)}")
-                                except json.JSONDecodeError:
-                                    pass  # Not all chunks are JSON
-                    except Exception as e:
-                        self.logger.debug(f"Could not log streaming chunk {request_id}: {str(e)}")
-                yield chunk
-        except Exception as e:
-            self.logger.error(f"Error processing stream: {str(e)}")
-            raise
+            error_content = {"error": {"message": str(e), "type": "stream_error"}}
+            return JSONResponse(
+                status_code=500,
+                content=error_content
+            )
 
     async def __aenter__(self):
         """Async context manager entry"""
