@@ -126,11 +126,33 @@ async def log_requests(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", "unknown")
     logger.info(f"Request {request_id}: {request.method} {request.url.path}")
     
+    # In debug mode, log more details of the request
+    if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG":
+        try:
+            # Log headers
+            logger.debug(f"Request headers {request_id}: {dict(request.headers)}")
+            
+            # Try to get and log body for non-streaming requests
+            if request.headers.get("Content-Type") == "application/json":
+                body_bytes = await request.body()
+                if body_bytes:
+                    try:
+                        body = json.loads(body_bytes)
+                        logger.debug(f"Request body {request_id}: {json.dumps(body)}")
+                    except json.JSONDecodeError:
+                        logger.debug(f"Request body {request_id}: Could not parse JSON body")
+        except Exception as e:
+            logger.debug(f"Error logging request details: {str(e)}")
+    
     # Process the request normally
     response = await call_next(request)
     
     # Log the response without accessing its body
     logger.info(f"Response {request_id}: Status {response.status_code}")
+    
+    # In debug mode, try to log response headers
+    if os.environ.get("LOG_LEVEL", "").upper() == "DEBUG":
+        logger.debug(f"Response headers {request_id}: {dict(response.headers)}")
     
     # For streaming responses, ensure we don't modify Content-Length
     if response.headers.get("Content-Type") == "text/event-stream":

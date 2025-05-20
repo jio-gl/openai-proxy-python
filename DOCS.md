@@ -31,6 +31,9 @@ cp .env-example .env
 ```bash
 # Start the server
 python run.py
+
+# Start with debug mode (dumps all request/response content to console)
+python run.py --debug
 ```
 
 By default, the server will run on `http://localhost:8000`.
@@ -91,6 +94,17 @@ The proxy employs several techniques to make requests appear as if they're comin
 
 ## Configuration Options
 
+### Command Line Parameters
+
+The following command line parameters are available when starting the server:
+
+- `--debug`: Enables debug mode with full request/response logging to the console. This is useful for debugging API issues and seeing exact request/response content.
+
+Example usage:
+```bash
+python run.py --debug
+```
+
 ### Environment Variables
 
 Edit the `.env` file to configure the proxy:
@@ -106,14 +120,30 @@ ANTHROPIC_API_KEY=your-anthropic-api-key
 ANTHROPIC_API_BASE_URL=https://api.anthropic.com
 
 # Logging settings
+LOG_LEVEL=INFO  # Set to DEBUG for more detailed logs
 LOG_REQUESTS=true
 LOG_RESPONSES=true
+LOG_TOKENS=false  # Set to true to log full token content (similar to --debug flag)
 
 # Security settings
 ALLOWED_MODELS=gpt-3.5-turbo,gpt-4,text-embedding-ada-002
 MAX_TOKENS=4000
 FORBIDDEN_INSTRUCTIONS="system:*jailbreak*,system:*ignore previous instructions*"
 ```
+
+### Debug Mode
+
+Debug mode provides detailed request and response information, useful for troubleshooting. When enabled:
+
+1. All request headers and bodies will be logged to the console
+2. All response headers will be logged to the console
+3. Full content of messages will be preserved in logs (rather than being redacted)
+
+To enable debug mode:
+- Use the `--debug` command line flag when starting the server
+- OR set `LOG_LEVEL=DEBUG` and `LOG_TOKENS=true` in your `.env` file
+
+**Note**: Debug mode will expose sensitive information in logs, so use it carefully and only in secure environments.
 
 ## Organization ID Handling
 

@@ -123,6 +123,25 @@ class RequestResponseLogger:
         # Create a deep copy to avoid modifying the original
         sanitized = copy.deepcopy(body) if isinstance(body, dict) else copy.deepcopy(body) if body else body
         
+        # Check if we're in debug mode with full content dump enabled
+        debug_mode = os.environ.get("LOG_TOKENS", "false").lower() == "true"
+        
+        # If debug mode is enabled, return the full content
+        if debug_mode:
+            # Still remove API keys for security
+            if isinstance(sanitized, dict):
+                # Sanitize common API key fields
+                sensitive_fields = ["api_key", "apiKey", "key", "token", "secret"]
+                for field in sensitive_fields:
+                    if field in sanitized:
+                        sanitized[field] = "[REDACTED]"
+                
+                # Sanitize authorization headers
+                if "headers" in sanitized and isinstance(sanitized["headers"], dict):
+                    sanitized["headers"] = self._sanitize_headers(sanitized["headers"])
+            
+            return sanitized
+        
         # Sanitize API keys and other sensitive information
         if isinstance(sanitized, dict):
             # Sanitize common API key fields
