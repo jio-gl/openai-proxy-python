@@ -108,10 +108,10 @@ class BaseAPIProxy:
                 await stream_client.aclose()
         
         # Get response content type and essential headers for streaming
-            response_headers = {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+        response_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "Transfer-Encoding": "chunked",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
