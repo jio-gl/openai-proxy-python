@@ -458,22 +458,63 @@ class OpenAIProxy(BaseAPIProxy):
                     
                     # For chat completions, check token limits
                     if path in ["chat/completions", "completions"]:
-                        # Calculate approximate token count
-                        # For chat/completions, count tokens in messages
+                        # Calculate token count more accurately
                         total_tokens = 0
                         if "messages" in body:
                             for msg in body["messages"]:
-                                # Rough estimation: 1 token ≈ 4 characters
+                                # Count tokens in the message content
                                 content = msg.get("content", "")
                                 if isinstance(content, str):
-                                    total_tokens += len(content) // 4
+                                    # More accurate token estimation:
+                                    # - Count words (spaces + 1)
+                                    # - Count numbers and special characters
+                                    # - Add overhead for message format
+                                    words = len(content.split())
+                                    chars = len(content)
+                                    special_chars = sum(1 for c in content if not c.isalnum() and not c.isspace())
+                                    
+                                    # Estimate: 
+                                    # - Each word is ~1.3 tokens (for word pieces)
+                                    # - Special characters are 1 token each
+                                    # - Add 4 tokens for message format (role, etc.)
+                                    msg_tokens = int(words * 1.3) + special_chars + 4
+                                    
+                                    # Add system message overhead
+                                    if msg.get("role") == "system":
+                                        msg_tokens += 2
+                                    
+                                    total_tokens += msg_tokens
+                                elif isinstance(content, list):  # Handle multimodal content
+                                    for item in content:
+                                        if isinstance(item, dict):
+                                            if item.get("type") == "text":
+                                                text = item.get("text", "")
+                                                words = len(text.split())
+                                                chars = len(text)
+                                                special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
+                                                msg_tokens = int(words * 1.3) + special_chars + 4
+                                                total_tokens += msg_tokens
+                                            elif item.get("type") == "image_url":
+                                                # Image tokens vary by model and size
+                                                # Use a conservative estimate
+                                                total_tokens += 1024  # Assume high-res image
                         
                         # Add max_tokens if specified
                         max_tokens = body.get("max_tokens", 2000)  # default to 2000 if not specified
                         total_tokens += max_tokens
                         
-                        # Check token limit
-                        await self.token_limiter.check_token_limit(total_tokens)
+                        # Add model overhead (varies by model)
+                        model = body.get("model", "")
+                        if "gpt-4" in model.lower():
+                            total_tokens += 8  # GPT-4 has higher overhead
+                        else:
+                            total_tokens += 4  # GPT-3.5 overhead
+                        
+                        # Log the token estimation
+                        self.logger.debug(f"Estimated total tokens for request: {total_tokens}")
+                        
+                        # Check token limit with a 10% buffer for safety
+                        await self.token_limiter.check_token_limit(int(total_tokens * 1.1))
                     
                     if debug_mode:
                         # Log the full body without redaction
