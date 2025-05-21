@@ -226,38 +226,28 @@ async def health_check():
 async def cerebras_health_check():
     """Health check specifically for the Cerebras backend"""
     try:
-        # Create a minimal test request
-        test_request = {
-            "model": "llama-3.3-70b",
-            "prompt": "Say hello",
-            "max_tokens": 5
-        }
+        from cerebras.cloud.sdk import Cerebras
         
-        # Build a simple request to test the connection
-        headers = {"Authorization": f"Bearer {os.environ.get('CEREBRAS_API_KEY')}"}
+        # Initialize client
+        client = Cerebras(
+            api_key=os.environ.get("CEREBRAS_API_KEY"),
+            timeout=5.0,
+            max_retries=1
+        )
         
         # Make a simple request to check if the service is responsive
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(
-                "https://api.cerebras.net/v1/completions",
-                json=test_request,
-                headers=headers
-            )
-            
-        if response.status_code == 200:
-            return {
-                "status": "healthy",
-                "message": "Cerebras backend is responding",
-                "backend": "Cerebras AI",
-                "model": "llama-3.3-70b"
-            }
-        else:
-            error_data = response.json() if response.headers.get("content-type") == "application/json" else {"error": "Non-JSON response"}
-            return {
-                "status": "unhealthy",
-                "message": f"Cerebras backend returned status {response.status_code}",
-                "details": error_data
-            }
+        response = client.completions.create(
+            prompt="Say hello",
+            model="llama-3.3-70b",
+            max_tokens=5
+        )
+        
+        return {
+            "status": "healthy",
+            "message": "Cerebras backend is responding",
+            "backend": "Cerebras AI",
+            "model": "llama-3.3-70b"
+        }
     except Exception as e:
         logger.error(f"Error checking Cerebras health: {str(e)}")
         return {

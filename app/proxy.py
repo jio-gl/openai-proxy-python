@@ -331,7 +331,7 @@ class OpenAIProxy(BaseAPIProxy):
         self.base_retry_delay = 1.0  # Initial delay in seconds
         
         # Token rate limiter
-        self.token_limiter = TokenRateLimiter(tpm_limit=30000)  # 30k TPM limit
+        self.token_limiter = TokenRateLimiter(tpm_limit=3000000)  # 3M TPM limit
     
     async def forward_request(self, request: Request, path: str, request_id: str = None):
         """Forward request to OpenAI API"""
@@ -1003,43 +1003,37 @@ class CerebrasProxy(BaseAPIProxy):
     """Proxy for Cerebras AI API requests (OpenAI-compatible format)"""
     def __init__(self, settings: Settings):
         super().__init__(settings)
-        self.base_url = "https://api.cerebras.net/v1"
-        self.model = "llama-3.3-70b"
         self.api_key = os.environ.get("CEREBRAS_API_KEY")
-        self.token_limiter = TokenRateLimiter(tpm_limit=30000)
-        self.max_retries = 3
-        self.base_retry_delay = 1.0
+        self.model = "llama-3.3-70b"
+        self.token_limiter = TokenRateLimiter(tpm_limit=3000000)
+        self.client = None
+        self._initialize_client()
+
+    def _initialize_client(self):
+        """Initialize the Cerebras client"""
+        try:
+            from cerebras.cloud.sdk import Cerebras
+            self.client = Cerebras(
+                api_key=self.api_key,
+                timeout=60.0,
+                max_retries=3
+            )
+        except ImportError:
+            self.logger.error("Failed to import cerebras-cloud-sdk. Please install it with: pip install cerebras-cloud-sdk")
+            raise
 
     async def forward_request(self, request: Request, path: str, request_id: str = None):
+        """Forward request to Cerebras API"""
         request_id = request_id or str(uuid.uuid4())
-        if path.startswith('v1/'):
-            path = path[3:]
-        target_url = f"{self.base_url}/{path.lstrip('/')}"
-        self.logger.info(f"Cerebras request {request_id}: {request.method} {path} -> {target_url}")
-        method = request.method
-        orig_headers = dict(request.headers)
+        self.logger.info(f"Cerebras request {request_id}: {request.method} {path}")
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
 
-        # Prepare headers
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": orig_headers.get("User-Agent", "CerebrasProxy/1.0"),
-            "Accept": orig_headers.get("accept", "application/json"),
-            "Connection": "keep-alive",
-        }
-        if orig_headers.get("accept") == "text/event-stream":
-            headers["Accept"] = "text/event-stream"
-            headers["Connection"] = "keep-alive"
-            headers["Cache-Control"] = "no-cache"
-            headers["Transfer-Encoding"] = "chunked"
-
-        # Get body
-        if method in ("POST", "PUT", "PATCH"):
+        # Get request body
+        if request.method in ("POST", "PUT", "PATCH"):
             try:
                 body_bytes = await request.body()
                 if not body_bytes:
-                    self.logger.warning(f"Empty request body for {method} request")
+                    self.logger.warning(f"Empty request body for {request.method} request")
                     return SafeJSONResponse(
                         status_code=400,
                         content={"error": {"message": "Empty request body", "type": "invalid_request_error"}}
@@ -1048,7 +1042,7 @@ class CerebrasProxy(BaseAPIProxy):
                     body = json.loads(body_bytes)
                     # Force model to llama-3.3-70b
                     body["model"] = self.model
-                    # Token limit check (reuse OpenAI logic)
+                    # Token limit check
                     total_tokens = 0
                     if "messages" in body:
                         for msg in body["messages"]:
@@ -1090,289 +1084,6 @@ class CerebrasProxy(BaseAPIProxy):
         else:
             body = {}
 
-        # Security checks (reuse OpenAI logic)
-        try:
-            self.security_filter.validate_request(body, path)
-        except HTTPException as exc:
-            self.logger.warning(f"Security violation: {exc.detail}")
-            return SafeJSONResponse(
-                status_code=exc.status_code,
-                content={"error": {"message": f"Security violation: {exc.detail}", "type": "security_filter_error"}}
-            )
-
-        is_streaming = "stream" in body and body["stream"] is True
-        if is_streaming:
-            if debug_mode:
-                self.logger.debug(f"Handling streaming request to {target_url}")
-            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id, self._log_response)
-
-        # Regular API call
-        try:
-            async with httpx.AsyncClient(
-                timeout=60.0,
-                verify=True,
-                follow_redirects=True,
-                headers=headers,
-            ) as client:
-                response = await client.request(
-                    method=method,
-                    url=target_url,
-                    headers=headers,
-                    json=body if method in ("POST", "PUT", "PATCH") else None,
-                    params=request.query_params,
-                )
-            status_code = response.status_code
-            response_headers = dict(response.headers)
-            if debug_mode:
-                self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
-                try:
-                    response_body = response.json()
-                    self.logger.debug(f"Response body {request_id}: {json.dumps(response_body)}")
-                except Exception as e:
-                    self.logger.debug(f"Could not log response body {request_id}: {str(e)}")
-            if "set-cookie" in response_headers:
-                self.client.cookies.extract_cookies(response)
-            if "content-encoding" in response_headers:
-                del response_headers["content-encoding"]
-            try:
-                response_body = response.json()
-                self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                response_headers.update({
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                    "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                    "Access-Control-Allow-Private-Network": "true",
-                    "Access-Control-Expose-Headers": "*"
-                })
-                return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-            except Exception as json_error:
-                self.request_logger.log_response(
-                    request_id, 
-                    status_code, 
-                    response_headers, 
-                    {"binary": True, "length": len(response.content)}
-                )
-                response_headers["content-length"] = str(len(response.content))
-                return Response(
-                    content=response.content,
-                    status_code=status_code, 
-                    headers=response_headers,
-                    media_type=response_headers.get("content-type", "application/json")
-                )
-        except Exception as e:
-            self.logger.error(f"Error creating client or making request: {str(e)}")
-            return SafeJSONResponse(
-                status_code=500,
-                content={"error": {"message": f"Error communicating with Cerebras API: {str(e)}", "type": "proxy_error"}}
-            )
-
-    async def _log_response(self, response, request_id, is_streaming=False):
-        """Log response details including rate limits and errors"""
-        status_code = response.status_code
-        response_headers = dict(response.headers)
-        
-        # Log rate limit headers if present
-        rate_limit_headers = {k: v for k, v in response_headers.items() if 'ratelimit' in k.lower()}
-        if rate_limit_headers:
-            self.logger.debug(f"Rate limit info for {request_id}: {json.dumps(rate_limit_headers, indent=2)}")
-        
-        # Log error response body if status is not 200
-        if status_code != 200:
-            try:
-                error_body = await response.json()
-                self.logger.debug(f"Error response body for {request_id}: {json.dumps(error_body, indent=2)}")
-                
-                # For rate limit errors, log at error level
-                if status_code == 429:
-                    self.logger.error(f"Rate limit exceeded for {request_id}: {json.dumps(error_body, indent=2)}")
-                    
-                    # Look for specific rate limit info in the error message
-                    if isinstance(error_body, dict) and 'error' in error_body:
-                        error_message = error_body['error'].get('message', '')
-                        self.logger.error(f"Rate limit reason: {error_message}")
-                        
-                        # Log suggestions based on error message
-                        if 'tokens per min' in error_message.lower():
-                            self.logger.error("Consider waiting or implementing token rate limiting")
-                        elif 'requests per min' in error_message.lower():
-                            self.logger.error("Consider waiting or implementing request rate limiting")
-                        elif 'organization' in error_message.lower() and 'quota' in error_message.lower():
-                            self.logger.error("Organization quota exceeded. Consider upgrading your plan.")
-                
-            except Exception as e:
-                self.logger.debug(f"Could not parse error response body for {request_id}: {str(e)}")
-        
-        return status_code, response_headers
-
-class AnthropicProxy(BaseAPIProxy):
-    """Proxy for Anthropic API requests"""
-    
-    def __init__(self, settings: Settings):
-        super().__init__(settings)
-        self.base_url = settings.anthropic_base_url
-        self.headers = settings.get_anthropic_headers()
-        
-        # Rate limit retry settings
-        self.max_retries = 3  
-        self.base_retry_delay = 1.0  # Initial delay in seconds
-    
-    async def forward_request(self, request: Request, path: str, request_id: str = None):
-        """Forward request to Anthropic API"""
-        # Generate request ID
-        request_id = request_id or str(uuid.uuid4())
-        
-        # Get request method
-        method = request.method
-        
-        # Build the target URL
-        target_url = f"{self.base_url}/{path.lstrip('/')}"
-        self.logger.info(f"Anthropic request {request_id}: {method} {path} -> {target_url}")
-        
-        # Extract headers from the original request
-        orig_headers = dict(request.headers)
-        
-        # Check if we're in debug mode
-        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
-        
-        # For OpenAI compatibility - intercept chat/completions
-        if path == "chat/completions" or path == "v1/chat/completions":
-            self.logger.info("Redirecting to Anthropic API: https://api.anthropic.com/v1/messages")
-            # Client is using OpenAI format but targeting Anthropic
-            target_url = "https://api.anthropic.com/v1/messages"
-        
-        # Log debug information about auth header presence
-        if debug_mode:
-            auth_header = orig_headers.get("x-api-key", "")
-            self.logger.debug(f"x-api-key header present: {bool(auth_header)}")
-            self.logger.debug(f"x-api-key from settings present: {bool(self.headers.get('x-api-key'))}")
-        
-        # Pick a random real browser user agent
-        browser_agents = [
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0"
-        ]
-        
-        # Create completely browser-like headers
-        headers = {
-            "x-api-key": orig_headers.get("x-api-key", self.headers.get("x-api-key")),
-            "anthropic-version": orig_headers.get("anthropic-version", "2023-06-01"),
-            "Content-Type": "application/json",
-            "User-Agent": random.choice(browser_agents),
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://console.anthropic.com/",
-            "Origin": "https://console.anthropic.com",
-            "Host": "api.anthropic.com",
-            "sec-fetch-site": "same-site",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-            "Access-Control-Allow-Private-Network": "true"
-        }
-        
-        # Use Accept header from the original request if present
-        if "accept" in orig_headers:
-            headers["Accept"] = orig_headers["accept"]
-            
-        # For streaming requests from clients, ensure proper headers
-        if "accept" in orig_headers and orig_headers["accept"] == "text/event-stream":
-            headers["Accept"] = "text/event-stream"
-            
-        # Add random request ID to simulate genuine traffic
-        if random.random() > 0.5:  # 50% chance to include
-            headers["X-Request-ID"] = str(uuid.uuid4())
-        
-        # Get body
-        if method in ("POST", "PUT", "PATCH"):
-            try:
-                # Log the request reading to help diagnose issues
-                if debug_mode:
-                    self.logger.debug(f"Reading Anthropic request body for {request_id}")
-
-                # Don't use retries - they may be causing issues
-                # Instead, just read the body cleanly once with proper error handling
-                body_bytes = await request.body()
-                if not body_bytes:
-                    self.logger.warning(f"Empty Anthropic request body for {method} request")
-                    empty_obj = {}
-                    self.request_logger.log_request(request_id, method, path, headers, empty_obj)
-                    return SafeJSONResponse(
-                        status_code=400,
-                        content={"error": {"message": "Empty request body", "type": "invalid_request_error"}}
-                    )
-
-                # Parse the JSON
-                try:
-                    body = json.loads(body_bytes)
-                    if debug_mode:
-                        # Create a sanitized version for logging
-                        sanitized_body = copy.deepcopy(body) if isinstance(body, dict) else body
-                        # Redact sensitive fields
-                        if isinstance(sanitized_body, dict):
-                            if "api_key" in sanitized_body:
-                                sanitized_body["api_key"] = "[REDACTED]"
-                            # Redact any potential sensitive data in messages
-                            if "messages" in sanitized_body:
-                                for msg in sanitized_body["messages"]:
-                                    if isinstance(msg, dict) and "content" in msg:
-                                        msg["content"] = "[CONTENT REDACTED FOR PRIVACY]"
-                        # Log the sanitized body
-                        body_json = json.dumps(sanitized_body)
-                        body_json = redact_api_key(body_json)
-                        self.logger.debug(f"Anthropic request body {request_id}: {body_json}")
-                    
-                    # Log the request
-                    self.request_logger.log_request(request_id, method, path, headers, body)
-                except json.JSONDecodeError as e:
-                    self.logger.error(f"Invalid JSON in Anthropic request body: {str(e)}")
-                    return SafeJSONResponse(
-                        status_code=400,
-                        content={"error": {"message": f"Invalid JSON: {str(e)}", "type": "invalid_request_error"}}
-                    )
-            except Exception as e:
-                self.logger.error(f"Error reading Anthropic request body: {str(e)}")
-                if debug_mode:
-                    self.logger.debug(f"Anthropic request body error details: {type(e).__name__}: {str(e)}")
-                return SafeJSONResponse(
-                    status_code=400,
-                    content={"error": {"message": f"Error processing request: {str(e)}", "type": "request_error"}}
-                )
-        else:
-            body = {}
-            self.request_logger.log_request(request_id, method, path, headers, body)
-        
-        # If in mock mode, return mock response
-        if self.mock_mode:
-            self.logger.info("Mock mode enabled, returning mock response")
-            
-            # For messages endpoints, handle streaming specially
-            if (path in ["v1/messages", "messages"] or path in ["chat/completions", "v1/chat/completions"]) and body.get("stream", False) is True:
-                return await self._handle_mock_streaming_request(request_id)
-                
-            return SafeJSONResponse(content=self._get_mock_response(body))
-        
-        # If we're processing an OpenAI format request but targeting Anthropic,
-        # convert the request format
-        if path == "chat/completions" or path == "v1/chat/completions":
-            try:
-                original_body = body.copy()
-                body = self._convert_openai_to_anthropic(body)
-                self.logger.info(f"Converted OpenAI format to Anthropic format: {body}")
-            except Exception as e:
-                self.logger.error(f"Error converting OpenAI format to Anthropic: {str(e)}")
-                return SafeJSONResponse(
-                    status_code=400,
-                    content={"error": {"message": f"Error converting to Anthropic format: {str(e)}", "type": "format_error"}}
-                )
-                
         # Security checks
         try:
             self.security_filter.validate_request(body, path)
@@ -1382,214 +1093,107 @@ class AnthropicProxy(BaseAPIProxy):
                 status_code=exc.status_code,
                 content={"error": {"message": f"Security violation: {exc.detail}", "type": "security_filter_error"}}
             )
-        
-        # Check if this is a streaming request
-        is_streaming = body.get("stream", False) is True
-        if is_streaming:
-            if debug_mode:
-                self.logger.debug(f"Handling Anthropic streaming request to {target_url}")
-            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id, self._log_response)
-        
-        # Regular API call - try with automatic retry for rate limits
+
         try:
-            # Check if rate limit retry is enabled
-            use_rate_limit_retry = True  # You can make this configurable
-            
-            if use_rate_limit_retry:
-                response_or_error = await self._handle_rate_limit_retry(request, method, target_url, headers, body, request_id, path)
-                
-                # If we got a JSONResponse (error case), return it directly
-                if isinstance(response_or_error, JSONResponse):
-                    return response_or_error
-                    
-                # Otherwise, we got a valid response
-                response = response_or_error
-            else:
-                # Original code for non-retry path
-                async with httpx.AsyncClient(
-                    timeout=60.0,
-                    verify=True,
-                    follow_redirects=True,
-                    headers=headers,
-                ) as client:
-                    response = await client.request(
-                        method=method,
-                        url=target_url,
-                        headers=headers,
-                        json=body if method in ("POST", "PUT", "PATCH") else None,
-                        params=request.query_params,
-                    )
-            
-            # Process the response
-            status_code = response.status_code
-            response_headers = dict(response.headers)
-            
-            if debug_mode:
-                self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
-                # Log response body in debug mode
-                try:
-                    response_body = response.json()
-                    response_json = json.dumps(response_body)
-                    self.logger.debug(f"Response body {request_id}: {response_json}")
-                except Exception as e:
-                    self.logger.debug(f"Could not log response body {request_id}: {str(e)}")
-            
-            # Extract cookies from response and update our cookie jar
-            if "set-cookie" in response_headers:
-                self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
-                self.client.cookies.extract_cookies(response)
-                
-                # Share cookies with streaming client for future requests
-                for cookie in self.client.cookies.jar:
-                    self.streaming_client.cookies.set(
-                        cookie.name, 
-                        cookie.value, 
-                        domain=cookie.domain, 
-                        path=cookie.path
-                    )
-            
-            # Remove content-encoding to prevent decoding issues
-            if "content-encoding" in response_headers:
-                del response_headers["content-encoding"]
-            
-            # Pass through binary response by default
-            try:
-                response_body = response.json()
+            # Handle streaming requests
+            if "stream" in body and body["stream"] is True:
                 if debug_mode:
-                    self.logger.debug(f"Response body: {json.dumps(response_body)}")
-                self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                # Add CORS and private network headers
-                response_headers.update({
+                    self.logger.debug(f"Handling streaming request for {request_id}")
+                
+                if "messages" in body:
+                    # Chat completions
+                    stream = self.client.chat.completions.create(
+                        messages=body["messages"],
+                        model=self.model,
+                        stream=True,
+                        **{k: v for k, v in body.items() if k not in ["messages", "model", "stream"]}
+                    )
+                else:
+                    # Text completions
+                    stream = self.client.completions.create(
+                        prompt=body["prompt"],
+                        model=self.model,
+                        stream=True,
+                        **{k: v for k, v in body.items() if k not in ["prompt", "model", "stream"]}
+                    )
+
+                async def stream_generator():
+                    try:
+                        for chunk in stream:
+                            if debug_mode:
+                                self.logger.debug(f"Stream chunk {request_id}: {chunk}")
+                            if hasattr(chunk.choices[0], 'delta'):
+                                # Chat completion chunk
+                                content = chunk.choices[0].delta.content
+                                if content:
+                                    yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'delta': {'content': content}}]})}\n\n"
+                            else:
+                                # Text completion chunk
+                                text = chunk.choices[0].text
+                                if text:
+                                    yield f"data: {json.dumps({'id': chunk.id, 'choices': [{'text': text}]})}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception as e:
+                        self.logger.error(f"Error in stream generator for {request_id}: {str(e)}")
+                        yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'stream_error'}})}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    stream_generator(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                        "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                        "Access-Control-Allow-Private-Network": "true",
+                        "Access-Control-Expose-Headers": "*"
+                    }
+                )
+
+            # Handle non-streaming requests
+            if "messages" in body:
+                # Chat completions
+                response = self.client.chat.completions.create(
+                    messages=body["messages"],
+                    model=self.model,
+                    **{k: v for k, v in body.items() if k not in ["messages", "model"]}
+                )
+            else:
+                # Text completions
+                response = self.client.completions.create(
+                    prompt=body["prompt"],
+                    model=self.model,
+                    **{k: v for k, v in body.items() if k not in ["prompt", "model"]}
+                )
+
+            # Convert response to dict
+            response_dict = response.to_dict()
+            if debug_mode:
+                self.logger.debug(f"Response {request_id}: {json.dumps(response_dict)}")
+
+            # Log response
+            self.request_logger.log_response(request_id, 200, {}, response_dict)
+
+            # Return response with CORS headers
+            return SafeJSONResponse(
+                content=response_dict,
+                status_code=200,
+                headers={
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
                     "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
                     "Access-Control-Allow-Private-Network": "true",
                     "Access-Control-Expose-Headers": "*"
-                })
-                return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-            except Exception as json_error:
-                # Just return the raw response content with the modified headers
-                if debug_mode:
-                    self.logger.debug(f"Non-JSON response, returning raw content: {str(json_error)}")
-                self.request_logger.log_response(
-                    request_id, 
-                    status_code, 
-                    response_headers, 
-                    {"binary": True, "length": len(response.content)}
-                )
-                # Ensure Content-Length is set correctly
-                response_headers["content-length"] = str(len(response.content))
-                return Response(
-                    content=response.content,
-                    status_code=status_code, 
-                    headers=response_headers,
-                    media_type=response_headers.get("content-type", "application/json")
-                )
+                }
+            )
+
         except Exception as e:
-            self.logger.error(f"Error creating client or making request: {str(e)}")
-            if debug_mode:
-                self.logger.debug(f"Detailed error: {type(e).__name__}: {str(e)}")
-                
-            # Find and update the fallback HTTP client section in OpenAIProxy
-            # Fallback to HTTP/1.1 if HTTP/2 fails
-            try:
-                if debug_mode:
-                    self.logger.debug("Falling back to HTTP/1.1")
-                
-                # Use the same timeout as the first attempt
-                timeout_seconds = 60.0 if debug_mode else 300.0
-                
-                async with httpx.AsyncClient(
-                    timeout=timeout_seconds,
-                    verify=True,
-                    trust_env=True,
-                    follow_redirects=True,
-                    headers=headers,
-                    cookies={},
-                    http2=False,  # Fallback to HTTP/1.1
-                ) as client:
-                    if is_streaming:
-                        return await self._handle_streaming_request(client, method, target_url, headers, body, request_id, self._log_response)
-                    
-                    if debug_mode:
-                        self.logger.debug(f"Sending fallback request to: {target_url}")
-                        
-                    response = await client.request(
-                        method=method,
-                        url=target_url,
-                        headers=headers,
-                        json=body if method in ("POST", "PUT", "PATCH") else None,
-                        params=request.query_params,
-                    )
-                    
-                    # Get response data
-                    status_code = response.status_code
-                    response_headers = dict(response.headers)
-                    
-                    if debug_mode:
-                        self.logger.debug(f"Fallback response received: status={status_code}")
-                    
-                    # Extract cookies from response and update our cookie jar
-                    if "set-cookie" in response_headers:
-                        self.logger.debug("Found Set-Cookie header in response, updating cookie jar")
-                        self.client.cookies.extract_cookies(response)
-                        
-                        # Share cookies with streaming client for future requests
-                        for cookie in self.client.cookies.jar:
-                            self.streaming_client.cookies.set(
-                                cookie.name, 
-                                cookie.value, 
-                                domain=cookie.domain, 
-                                path=cookie.path
-                            )
-                    
-                    # Remove content-encoding to prevent decoding issues
-                    if "content-encoding" in response_headers:
-                        del response_headers["content-encoding"]
-                    
-                    # Pass through binary response by default
-                    try:
-                        response_body = response.json()
-                        self.request_logger.log_response(request_id, status_code, response_headers, response_body)
-                        # Add CORS and private network headers
-                        response_headers.update({
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
-                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
-                            "Access-Control-Allow-Private-Network": "true",
-                            "Access-Control-Expose-Headers": "*"
-                        })
-                        return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                    except Exception as json_error:
-                        # Just return the raw response content with the modified headers
-                        if debug_mode:
-                            self.logger.debug(f"Non-JSON fallback response: {str(json_error)}")
-                        self.request_logger.log_response(
-                            request_id, 
-                            status_code, 
-                            response_headers, 
-                            {"binary": True, "length": len(response.content)}
-                        )
-                        # Ensure Content-Length is set correctly
-                        response_headers["content-length"] = str(len(response.content))
-                        return Response(
-                            content=response.content,
-                            status_code=status_code, 
-                            headers=response_headers,
-                            media_type=response_headers.get("content-type", "application/json")
-                        )
-            except Exception as fallback_error:
-                self.logger.error(f"Error in fallback HTTP/1.1 request: {str(fallback_error)}")
-                if debug_mode:
-                    self.logger.debug(f"Detailed fallback error: {type(fallback_error).__name__}: {str(fallback_error)}")
-                error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(fallback_error)}", "type": "proxy_error"}}
-                error_json = json.dumps(error_content).encode('utf-8')
-                return SafeJSONResponse(
-                    status_code=500,
-                    content=error_content,
-                    headers={"Content-Length": str(len(error_json))}
-                )
-    
+            self.logger.error(f"Error communicating with Cerebras API: {str(e)}")
+            return SafeJSONResponse(
+                status_code=500,
+                content={"error": {"message": f"Error communicating with Cerebras API: {str(e)}", "type": "proxy_error"}}
+            )
+
     def _get_mock_response(self, body):
         """Generate a mock response for testing"""
         messages = body.get("messages", [])
@@ -1601,7 +1205,7 @@ class AnthropicProxy(BaseAPIProxy):
                 user_message = message.get("content", "Hello")
                 break
         
-        # Generate a simple response in Anthropic format
+        # Generate a simple response in Cerebras format
         return {
             "id": "msg_mockanthropicresponse123",
             "type": "message",
@@ -1609,7 +1213,7 @@ class AnthropicProxy(BaseAPIProxy):
             "content": [
                 {
                     "type": "text",
-                    "text": "Hi! This is a mock response from the Anthropic API Firewall."
+                    "text": "Hi! This is a mock response from the Cerebras API Firewall."
                 }
             ],
             "model": body.get("model", "claude-3-7-sonnet-20250219"),
@@ -1621,8 +1225,8 @@ class AnthropicProxy(BaseAPIProxy):
         }
         
     async def _handle_mock_streaming_request(self, request_id):
-        """Handle mock streaming responses for Anthropic API"""
-        self.logger.info(f"Generating mock Anthropic streaming response for {request_id}")
+        """Handle mock streaming responses for Cerebras API"""
+        self.logger.info(f"Generating mock Cerebras streaming response for {request_id}")
         
         # Check if we're in debug mode
         debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
@@ -1645,7 +1249,7 @@ class AnthropicProxy(BaseAPIProxy):
                 chunks = chunks[:4]
             
             # Log that we're starting to send chunks
-            self.logger.info(f"Sending {len(chunks)} mock Anthropic stream chunks for {request_id}")
+            self.logger.info(f"Sending {len(chunks)} mock Cerebras stream chunks for {request_id}")
             
             # Stream each chunk
             for i, chunk in enumerate(chunks):
@@ -1660,8 +1264,10 @@ class AnthropicProxy(BaseAPIProxy):
                 
                 # Log progress in debug mode
                 if debug_mode:
-                    self.logger.debug(f"Sent Anthropic mock chunk {i+1}/{len(chunks)}")
+                    self.logger.debug(f"Sent Cerebras mock chunk {i+1}/{len(chunks)}")
             
+            self.logger.info(f"Completed mock Cerebras streaming response for {request_id}")
+        
             self.logger.info(f"Completed mock Anthropic streaming response for {request_id}")
         
         # Setup headers for streaming response
@@ -1756,4 +1362,336 @@ class AnthropicProxy(BaseAPIProxy):
         return JSONResponse(
             status_code=429,
             content=error_response
+        ) 
+
+class AnthropicProxy(BaseAPIProxy):
+    """Proxy for Anthropic API requests"""
+    
+    def __init__(self, settings: Settings):
+        super().__init__(settings)
+        self.base_url = settings.anthropic_base_url
+        self.headers = settings.get_anthropic_headers()
+    
+    async def forward_request(self, request: Request, path: str):
+        """Forward request to Anthropic API"""
+        # Generate request ID
+        request_id = str(uuid.uuid4())
+        
+        # Get request method
+        method = request.method
+        
+        # Build target URL - Anthropic has no v1 in base URL unlike OpenAI
+        target_url = f"{self.settings.anthropic_base_url}/{path.lstrip('/')}"
+        
+        # For OpenAI compatibility - intercept chat/completions
+        if path == "chat/completions" or path == "v1/chat/completions":
+            self.logger.info("Redirecting to Anthropic API: https://api.anthropic.com/v1/messages")
+            # Client is using OpenAI format but targeting Anthropic
+            target_url = "https://api.anthropic.com/v1/messages"
+        
+        # Get original headers
+        orig_headers = dict(request.headers)
+        
+        # Pick a random real browser user agent
+        browser_agents = [
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0"
+        ]
+        
+        # Create completely browser-like headers
+        headers = {
+            "x-api-key": orig_headers.get("x-api-key", self.headers.get("x-api-key")),
+            "anthropic-version": orig_headers.get("anthropic-version", "2023-06-01"),
+            "Content-Type": "application/json",
+            "User-Agent": random.choice(browser_agents),
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://console.anthropic.com/",
+            "Origin": "https://console.anthropic.com",
+            "Host": "api.anthropic.com",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+            "Access-Control-Allow-Private-Network": "true"
+        }
+        
+        # Use Accept header from the original request if present
+        if "accept" in orig_headers:
+            headers["Accept"] = orig_headers["accept"]
+            
+        # For streaming requests from clients, ensure proper headers
+        if "accept" in orig_headers and orig_headers["accept"] == "text/event-stream":
+            headers["Accept"] = "text/event-stream"
+            
+        # Add random request ID to simulate genuine traffic
+        if random.random() > 0.5:  # 50% chance to include
+            headers["X-Request-ID"] = str(uuid.uuid4())
+        
+        # Get body
+        if method in ("POST", "PUT", "PATCH"):
+            try:
+                body = await request.json()
+                self.request_logger.log_request(request_id, method, path, headers, body)
+            except Exception as e:
+                self.logger.error(f"Error parsing request body: {str(e)}")
+                empty_body = {}
+                self.request_logger.log_request(request_id, method, path, headers, empty_body)
+                return SafeJSONResponse(
+                    status_code=400,
+                    content={"error": {"message": f"Invalid request body: {str(e)}", "type": "invalid_request_error"}}
+                )
+        else:
+            body = {}
+            self.request_logger.log_request(request_id, method, path, headers, body)
+        
+        # If in mock mode, return mock response
+        if self.mock_mode:
+            self.logger.info("Mock mode enabled, returning mock response")
+            
+            # For messages endpoints, handle streaming specially
+            if (path in ["v1/messages", "messages"] or path in ["chat/completions", "v1/chat/completions"]) and body.get("stream", False) is True:
+                return await self._handle_mock_streaming_request(request_id)
+                
+            return SafeJSONResponse(content=self._get_mock_response(body))
+        
+        # If we're processing an OpenAI format request but targeting Anthropic,
+        # convert the request format
+        if path == "chat/completions" or path == "v1/chat/completions":
+            try:
+                original_body = body.copy()
+                body = self._convert_openai_to_anthropic(body)
+                self.logger.info(f"Converted OpenAI format to Anthropic format: {body}")
+            except Exception as e:
+                self.logger.error(f"Error converting OpenAI format to Anthropic: {str(e)}")
+                return SafeJSONResponse(
+                    status_code=400,
+                    content={"error": {"message": f"Error converting to Anthropic format: {str(e)}", "type": "format_error"}}
+                )
+                
+        # Security checks
+        try:
+            self.security_filter.validate_request(body, path)
+        except HTTPException as exc:
+            self.logger.warning(f"Security violation: {exc.detail}")
+            return SafeJSONResponse(
+                status_code=exc.status_code,
+                content={"error": {"message": f"Security violation: {exc.detail}", "type": "security_filter_error"}}
+            )
+        
+        # Check if this is a streaming request
+        is_streaming = body.get("stream", False) is True
+        if is_streaming:
+            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id)
+        
+        # Regular API call
+        try:
+            # Simplify the client configuration for reliability
+            async with httpx.AsyncClient(
+                timeout=300.0,  # 5 minute timeout
+                verify=True,    # Use system certificates for verification
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                # Handle streaming responses
+                if body and body.get("stream", False):
+                    return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
+                
+                try:
+                    # Handle regular responses - pass full URL directly
+                    self.logger.info(f"Sending request to: {target_url}")
+                    response = await client.request(
+                        method=method,
+                        url=target_url,  # Use full target URL to ensure proper SNI
+                        headers=headers,
+                        json=body if method in ("POST", "PUT", "PATCH") else None,
+                        params=request.query_params,
+                    )
+                    
+                    # Get response data
+                    status_code = response.status_code
+                    response_headers = dict(response.headers)
+                    
+                    # Remove content-encoding to prevent decoding issues
+                    if "content-encoding" in response_headers:
+                        del response_headers["content-encoding"]
+                    
+                    # Pass through binary response by default
+                    try:
+                        response_body = response.json()
+                        self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                        # Add CORS and private network headers
+                        response_headers.update({
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                            "Access-Control-Allow-Private-Network": "true",
+                            "Access-Control-Expose-Headers": "*"
+                        })
+                        return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+                    except:
+                        # Just return the raw response content with the modified headers
+                        self.request_logger.log_response(
+                            request_id, 
+                            status_code, 
+                            response_headers, 
+                            {"binary": True, "length": len(response.content)}
+                        )
+                        # Ensure Content-Length is set correctly
+                        response_headers["content-length"] = str(len(response.content))
+                        return Response(
+                            content=response.content,
+                            status_code=status_code, 
+                            headers=response_headers,
+                            media_type=response_headers.get("content-type", "application/json")
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error making request to Anthropic API: {str(e)}")
+                    error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(e)}", "type": "proxy_error"}}
+                    error_json = json.dumps(error_content).encode('utf-8')
+                    return SafeJSONResponse(
+                        status_code=500,
+                        content=error_content,
+                        headers={"Content-Length": str(len(error_json))}
+                    )
+        except Exception as e:
+            self.logger.error(f"Error creating client or making request: {str(e)}")
+            # Fallback to HTTP/1.1 if HTTP/2 fails
+            try:
+                async with httpx.AsyncClient(
+                    timeout=300.0,
+                    verify=True,
+                    trust_env=True,
+                    follow_redirects=True,
+                    headers=headers,
+                    cookies={},
+                    http2=False,  # Fallback to HTTP/1.1
+                ) as client:
+                    if body and body.get("stream", False):
+                        return await self._handle_streaming_request(client, method, target_url, headers, body, request_id)
+                    
+                    response = await client.request(
+                        method=method,
+                        url=target_url,
+                        headers=headers,
+                        json=body if method in ("POST", "PUT", "PATCH") else None,
+                        params=request.query_params,
+                    )
+                    
+                    # Get response data
+                    status_code = response.status_code
+                    response_headers = dict(response.headers)
+                    
+                    # Remove content-encoding to prevent decoding issues
+                    if "content-encoding" in response_headers:
+                        del response_headers["content-encoding"]
+                    
+                    # Pass through binary response by default
+                    try:
+                        response_body = response.json()
+                        self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                        # Add CORS and private network headers
+                        response_headers.update({
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                            "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                            "Access-Control-Allow-Private-Network": "true",
+                            "Access-Control-Expose-Headers": "*"
+                        })
+                        return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+                    except:
+                        # Just return the raw response content with the modified headers
+                        self.request_logger.log_response(
+                            request_id, 
+                            status_code, 
+                            response_headers, 
+                            {"binary": True, "length": len(response.content)}
+                        )
+                        # Ensure Content-Length is set correctly
+                        response_headers["content-length"] = str(len(response.content))
+                        return Response(
+                            content=response.content,
+                            status_code=status_code, 
+                            headers=response_headers,
+                            media_type=response_headers.get("content-type", "application/json")
+                        )
+            except Exception as fallback_error:
+                self.logger.error(f"Error in fallback HTTP/1.1 request: {str(fallback_error)}")
+                error_content = {"error": {"message": f"Error communicating with Anthropic API: {str(fallback_error)}", "type": "proxy_error"}}
+                error_json = json.dumps(error_content).encode('utf-8')
+                return SafeJSONResponse(
+                    status_code=500,
+                    content=error_content,
+                    headers={"Content-Length": str(len(error_json))}
+                )
+    
+    def _get_mock_response(self, body):
+        """Generate a mock response for testing"""
+        messages = body.get("messages", [])
+        user_message = "Hello"
+        
+        # Find the last user message
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                user_message = message.get("content", "Hello")
+                break
+        
+        # Generate a simple response in Anthropic format
+        return {
+            "id": "msg_mockanthropicresponse123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Hi! This is a mock response from the Anthropic API Firewall."
+                }
+            ],
+            "model": body.get("model", "claude-3-7-sonnet-20250219"),
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 10
+            }
+        }
+        
+    async def _handle_mock_streaming_request(self, request_id):
+        """Handle mock streaming responses for testing Anthropic API"""
+        self.logger.info(f"Handling mock Anthropic streaming request {request_id}")
+        
+        async def mock_stream_generator():
+            # Create the chunks with proper line endings
+            chunks = [
+                {"type": "message_start", "message": {"id": "msg_mockanthropicstream123", "type": "message", "role": "assistant", "content": [], "model": "claude-3-sonnet-20240229", "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 10}}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "! This is a mock "}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "response from the Anthropic API Firewall."}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None, "usage": {"output_tokens": 10}}},
+                {"type": "message_stop"}
+            ]
+            
+            # Yield each chunk properly formatted as a server-sent event with proper newlines
+            for chunk in chunks:
+                # Format the chunk as a proper server-sent event
+                chunk_str = json.dumps(chunk)
+                yield f"data: {chunk_str}\r\n\r\n".encode('utf-8')
+                await asyncio.sleep(0.1)
+            
+            # End of the stream
+            yield b"data: [DONE]\r\n\r\n"
+        
+        # Use proper content type for EventStream
+        return StreamingResponse(
+            mock_stream_generator(),
+            media_type="text/event-stream"
         ) 
