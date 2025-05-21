@@ -999,6 +999,211 @@ class OpenAIProxy(BaseAPIProxy):
             content=error_response
         )
 
+class CerebrasProxy(BaseAPIProxy):
+    """Proxy for Cerebras AI API requests (OpenAI-compatible format)"""
+    def __init__(self, settings: Settings):
+        super().__init__(settings)
+        self.base_url = "https://api.cerebras.net/v1"
+        self.model = "llama-3.3-70b"
+        self.api_key = os.environ.get("CEREBRAS_API_KEY")
+        self.token_limiter = TokenRateLimiter(tpm_limit=30000)
+        self.max_retries = 3
+        self.base_retry_delay = 1.0
+
+    async def forward_request(self, request: Request, path: str, request_id: str = None):
+        request_id = request_id or str(uuid.uuid4())
+        if path.startswith('v1/'):
+            path = path[3:]
+        target_url = f"{self.base_url}/{path.lstrip('/')}"
+        self.logger.info(f"Cerebras request {request_id}: {request.method} {path} -> {target_url}")
+        method = request.method
+        orig_headers = dict(request.headers)
+        debug_mode = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+
+        # Prepare headers
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": orig_headers.get("User-Agent", "CerebrasProxy/1.0"),
+            "Accept": orig_headers.get("accept", "application/json"),
+            "Connection": "keep-alive",
+        }
+        if orig_headers.get("accept") == "text/event-stream":
+            headers["Accept"] = "text/event-stream"
+            headers["Connection"] = "keep-alive"
+            headers["Cache-Control"] = "no-cache"
+            headers["Transfer-Encoding"] = "chunked"
+
+        # Get body
+        if method in ("POST", "PUT", "PATCH"):
+            try:
+                body_bytes = await request.body()
+                if not body_bytes:
+                    self.logger.warning(f"Empty request body for {method} request")
+                    return SafeJSONResponse(
+                        status_code=400,
+                        content={"error": {"message": "Empty request body", "type": "invalid_request_error"}}
+                    )
+                try:
+                    body = json.loads(body_bytes)
+                    # Force model to llama-3.3-70b
+                    body["model"] = self.model
+                    # Token limit check (reuse OpenAI logic)
+                    total_tokens = 0
+                    if "messages" in body:
+                        for msg in body["messages"]:
+                            content = msg.get("content", "")
+                            if isinstance(content, str):
+                                words = len(content.split())
+                                special_chars = sum(1 for c in content if not c.isalnum() and not c.isspace())
+                                msg_tokens = int(words * 1.3) + special_chars + 4
+                                if msg.get("role") == "system":
+                                    msg_tokens += 2
+                                total_tokens += msg_tokens
+                            elif isinstance(content, list):
+                                for item in content:
+                                    if isinstance(item, dict) and item.get("type") == "text":
+                                        text = item.get("text", "")
+                                        words = len(text.split())
+                                        special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
+                                        msg_tokens = int(words * 1.3) + special_chars + 4
+                                        total_tokens += msg_tokens
+                    max_tokens = body.get("max_tokens", 2000)
+                    total_tokens += max_tokens
+                    total_tokens += 8  # Overhead for llama-3.3-70b
+                    self.logger.debug(f"Estimated total tokens for request: {total_tokens}")
+                    await self.token_limiter.check_token_limit(int(total_tokens * 1.1))
+                    if debug_mode:
+                        self.logger.debug(f"Request body {request_id}: {json.dumps(body)}")
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Invalid JSON in request body: {str(e)}")
+                    return SafeJSONResponse(
+                        status_code=400,
+                        content={"error": {"message": f"Invalid JSON: {str(e)}", "type": "invalid_request_error"}}
+                    )
+            except Exception as e:
+                self.logger.error(f"Error reading request body: {str(e)}")
+                return SafeJSONResponse(
+                    status_code=400,
+                    content={"error": {"message": f"Error processing request: {str(e)}", "type": "request_error"}}
+                )
+        else:
+            body = {}
+
+        # Security checks (reuse OpenAI logic)
+        try:
+            self.security_filter.validate_request(body, path)
+        except HTTPException as exc:
+            self.logger.warning(f"Security violation: {exc.detail}")
+            return SafeJSONResponse(
+                status_code=exc.status_code,
+                content={"error": {"message": f"Security violation: {exc.detail}", "type": "security_filter_error"}}
+            )
+
+        is_streaming = "stream" in body and body["stream"] is True
+        if is_streaming:
+            if debug_mode:
+                self.logger.debug(f"Handling streaming request to {target_url}")
+            return await self._handle_streaming_request(self.client, method, target_url, headers, body, request_id, self._log_response)
+
+        # Regular API call
+        try:
+            async with httpx.AsyncClient(
+                timeout=60.0,
+                verify=True,
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                response = await client.request(
+                    method=method,
+                    url=target_url,
+                    headers=headers,
+                    json=body if method in ("POST", "PUT", "PATCH") else None,
+                    params=request.query_params,
+                )
+            status_code = response.status_code
+            response_headers = dict(response.headers)
+            if debug_mode:
+                self.logger.debug(f"Response received: status={status_code}, headers={response_headers}")
+                try:
+                    response_body = response.json()
+                    self.logger.debug(f"Response body {request_id}: {json.dumps(response_body)}")
+                except Exception as e:
+                    self.logger.debug(f"Could not log response body {request_id}: {str(e)}")
+            if "set-cookie" in response_headers:
+                self.client.cookies.extract_cookies(response)
+            if "content-encoding" in response_headers:
+                del response_headers["content-encoding"]
+            try:
+                response_body = response.json()
+                self.request_logger.log_response(request_id, status_code, response_headers, response_body)
+                response_headers.update({
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization, OpenAI-Organization",
+                    "Access-Control-Allow-Private-Network": "true",
+                    "Access-Control-Expose-Headers": "*"
+                })
+                return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
+            except Exception as json_error:
+                self.request_logger.log_response(
+                    request_id, 
+                    status_code, 
+                    response_headers, 
+                    {"binary": True, "length": len(response.content)}
+                )
+                response_headers["content-length"] = str(len(response.content))
+                return Response(
+                    content=response.content,
+                    status_code=status_code, 
+                    headers=response_headers,
+                    media_type=response_headers.get("content-type", "application/json")
+                )
+        except Exception as e:
+            self.logger.error(f"Error creating client or making request: {str(e)}")
+            return SafeJSONResponse(
+                status_code=500,
+                content={"error": {"message": f"Error communicating with Cerebras API: {str(e)}", "type": "proxy_error"}}
+            )
+
+    async def _log_response(self, response, request_id, is_streaming=False):
+        """Log response details including rate limits and errors"""
+        status_code = response.status_code
+        response_headers = dict(response.headers)
+        
+        # Log rate limit headers if present
+        rate_limit_headers = {k: v for k, v in response_headers.items() if 'ratelimit' in k.lower()}
+        if rate_limit_headers:
+            self.logger.debug(f"Rate limit info for {request_id}: {json.dumps(rate_limit_headers, indent=2)}")
+        
+        # Log error response body if status is not 200
+        if status_code != 200:
+            try:
+                error_body = await response.json()
+                self.logger.debug(f"Error response body for {request_id}: {json.dumps(error_body, indent=2)}")
+                
+                # For rate limit errors, log at error level
+                if status_code == 429:
+                    self.logger.error(f"Rate limit exceeded for {request_id}: {json.dumps(error_body, indent=2)}")
+                    
+                    # Look for specific rate limit info in the error message
+                    if isinstance(error_body, dict) and 'error' in error_body:
+                        error_message = error_body['error'].get('message', '')
+                        self.logger.error(f"Rate limit reason: {error_message}")
+                        
+                        # Log suggestions based on error message
+                        if 'tokens per min' in error_message.lower():
+                            self.logger.error("Consider waiting or implementing token rate limiting")
+                        elif 'requests per min' in error_message.lower():
+                            self.logger.error("Consider waiting or implementing request rate limiting")
+                        elif 'organization' in error_message.lower() and 'quota' in error_message.lower():
+                            self.logger.error("Organization quota exceeded. Consider upgrading your plan.")
+                
+            except Exception as e:
+                self.logger.debug(f"Could not parse error response body for {request_id}: {str(e)}")
+        
+        return status_code, response_headers
+
 class AnthropicProxy(BaseAPIProxy):
     """Proxy for Anthropic API requests"""
     

@@ -8,8 +8,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 import json
 import copy
+import httpx
 
-from app.proxy import OpenAIProxy, AnthropicProxy, SafeJSONResponse
+from app.proxy import OpenAIProxy, AnthropicProxy, CerebrasProxy, SafeJSONResponse
 from app.config import Settings
 from app.logging import setup_logging, redact_api_key
 
@@ -120,6 +121,7 @@ async def mask_private_network(request: Request, call_next):
 # Create proxies
 openai_proxy = OpenAIProxy(settings)
 anthropic_proxy = AnthropicProxy(settings)
+cerebras_proxy = CerebrasProxy(settings)
 
 @app.get("/")
 async def root():
@@ -131,7 +133,7 @@ async def root():
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def openai_proxy_endpoint(request: Request, path: str):
-    """Proxy all requests to OpenAI API"""
+    """Proxy requests to OpenAI API or Cerebras based on endpoint path"""
     # Handle OPTIONS requests directly for CORS preflight
     if request.method == "OPTIONS":
         return Response(
@@ -143,16 +145,38 @@ async def openai_proxy_endpoint(request: Request, path: str):
                 "Access-Control-Max-Age": "3600",
             },
         )
-    
     try:
-        # Pass the request_id from middleware to the proxy
         request_id = getattr(request.state, "request_id", f"req_{id(request)}")
-        return await openai_proxy.forward_request(request, path, request_id)
+        
+        # Define which paths to route to Cerebras
+        cerebras_paths = [
+            "completions",
+            "chat/completions"
+        ]
+        
+        # Check if the current path should be routed to Cerebras
+        use_cerebras = False
+        for cerebras_path in cerebras_paths:
+            if path == cerebras_path or path.endswith(f"/{cerebras_path}"):
+                use_cerebras = True
+                break
+        
+        # Route request to the appropriate backend
+        if use_cerebras:
+            logger.info(f"[BACKEND:CEREBRAS] Routing request {request_id} for {path} to Cerebras AI with model llama-3.3-70b")
+            try:
+                return await cerebras_proxy.forward_request(request, path, request_id)
+            except Exception as ce:
+                # If Cerebras fails, log the error and fall back to OpenAI
+                logger.error(f"Cerebras request failed: {str(ce)}. Falling back to OpenAI.")
+                return await openai_proxy.forward_request(request, path, request_id)
+        else:
+            logger.info(f"[BACKEND:OPENAI] Routing request {request_id} for {path} to OpenAI")
+            return await openai_proxy.forward_request(request, path, request_id)
     except Exception as e:
         error_message = str(e)
-        # Redact any API keys that might be in error messages
         error_message = redact_api_key(error_message)
-        logger.error(f"Error proxying OpenAI request: {error_message}")
+        logger.error(f"Error proxying request: {error_message}")
         error_content = {"error": {"message": f"Proxy error: {error_message}", "type": "proxy_error"}}
         error_json = json.dumps(error_content).encode('utf-8')
         return SafeJSONResponse(
@@ -192,6 +216,55 @@ async def anthropic_proxy_endpoint(request: Request, path: str):
             content=error_content,
             headers={"Content-Length": str(len(error_json))}
         )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for the proxy server"""
+    return {"status": "healthy", "message": "Proxy server is running"}
+
+@app.get("/health/cerebras")
+async def cerebras_health_check():
+    """Health check specifically for the Cerebras backend"""
+    try:
+        # Create a minimal test request
+        test_request = {
+            "model": "llama-3.3-70b",
+            "prompt": "Say hello",
+            "max_tokens": 5
+        }
+        
+        # Build a simple request to test the connection
+        headers = {"Authorization": f"Bearer {os.environ.get('CEREBRAS_API_KEY')}"}
+        
+        # Make a simple request to check if the service is responsive
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                "https://api.cerebras.net/v1/completions",
+                json=test_request,
+                headers=headers
+            )
+            
+        if response.status_code == 200:
+            return {
+                "status": "healthy",
+                "message": "Cerebras backend is responding",
+                "backend": "Cerebras AI",
+                "model": "llama-3.3-70b"
+            }
+        else:
+            error_data = response.json() if response.headers.get("content-type") == "application/json" else {"error": "Non-JSON response"}
+            return {
+                "status": "unhealthy",
+                "message": f"Cerebras backend returned status {response.status_code}",
+                "details": error_data
+            }
+    except Exception as e:
+        logger.error(f"Error checking Cerebras health: {str(e)}")
+        return {
+            "status": "unhealthy",
+            "message": f"Error connecting to Cerebras: {str(e)}",
+            "error": str(e)
+        }
 
 if __name__ == "__main__":
     import uvicorn
