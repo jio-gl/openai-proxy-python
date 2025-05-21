@@ -15,6 +15,7 @@ import urllib.parse
 from app.config import Settings
 from app.logging import RequestResponseLogger, redact_api_key
 from app.security import SecurityFilter
+from app.rate_limiter import TokenRateLimiter
 
 # Create a custom JSONResponse that always sets a proper content-length header
 class SafeJSONResponse(JSONResponse):
@@ -104,15 +105,42 @@ class BaseAPIProxy:
                 # Ensure proper stream termination
                 yield b"data: [DONE]\n\n"
         except httpx.StreamClosed as e:
-            self.logger.warning(f"Stream closed while processing {request_id}: {str(e)}")
+            self.logger.error(f"Stream closed unexpectedly for request {request_id}: {str(e)}")
             # Return a graceful error message
-            error_msg = json.dumps({"error": {"message": "Stream was closed", "type": "stream_error"}})
+            error_msg = json.dumps({"error": {"message": "Stream was closed unexpectedly", "type": "stream_error", "details": str(e)}})
+            yield f"data: {error_msg}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+        except httpx.ReadTimeout as e:
+            self.logger.error(f"Stream read timeout for request {request_id}: {str(e)}")
+            error_msg = json.dumps({"error": {"message": "Stream read timeout", "type": "stream_error", "details": str(e)}})
+            yield f"data: {error_msg}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+        except httpx.WriteTimeout as e:
+            self.logger.error(f"Stream write timeout for request {request_id}: {str(e)}")
+            error_msg = json.dumps({"error": {"message": "Stream write timeout", "type": "stream_error", "details": str(e)}})
+            yield f"data: {error_msg}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+        except httpx.ConnectTimeout as e:
+            self.logger.error(f"Stream connection timeout for request {request_id}: {str(e)}")
+            error_msg = json.dumps({"error": {"message": "Stream connection timeout", "type": "stream_error", "details": str(e)}})
+            yield f"data: {error_msg}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+        except httpx.HTTPStatusError as e:
+            self.logger.error(f"Stream HTTP error for request {request_id}: {str(e)}")
+            error_msg = json.dumps({"error": {"message": f"Stream HTTP error: {e.response.status_code}", "type": "stream_error", "details": str(e)}})
             yield f"data: {error_msg}\n\n".encode('utf-8')
             yield b"data: [DONE]\n\n"
         except Exception as e:
-            self.logger.error(f"Error processing stream {request_id}: {str(e)}")
-            # Return a graceful error message
-            error_msg = json.dumps({"error": {"message": str(e), "type": "stream_error"}})
+            self.logger.error(f"Unexpected error processing stream {request_id}: {str(e)}", exc_info=True)
+            # Return a graceful error message with more context
+            error_msg = json.dumps({
+                "error": {
+                    "message": f"Unexpected stream error: {str(e)}",
+                    "type": "stream_error",
+                    "details": str(e),
+                    "request_id": request_id
+                }
+            })
             yield f"data: {error_msg}\n\n".encode('utf-8')
             yield b"data: [DONE]\n\n"
 
@@ -214,13 +242,62 @@ class BaseAPIProxy:
                     status_code=response.status_code,
                     headers=response_headers
                 )
+        except httpx.ConnectTimeout as e:
+            self.logger.error(f"Connection timeout for streaming request {request_id}: {str(e)}")
+            error_content = {
+                "error": {
+                    "message": "Connection timeout while establishing stream",
+                    "type": "stream_error",
+                    "details": str(e),
+                    "request_id": request_id
+                }
+            }
+            return JSONResponse(status_code=504, content=error_content)
+        except httpx.ReadTimeout as e:
+            self.logger.error(f"Read timeout for streaming request {request_id}: {str(e)}")
+            error_content = {
+                "error": {
+                    "message": "Read timeout while streaming response",
+                    "type": "stream_error",
+                    "details": str(e),
+                    "request_id": request_id
+                }
+            }
+            return JSONResponse(status_code=504, content=error_content)
+        except httpx.WriteTimeout as e:
+            self.logger.error(f"Write timeout for streaming request {request_id}: {str(e)}")
+            error_content = {
+                "error": {
+                    "message": "Write timeout while streaming response",
+                    "type": "stream_error",
+                    "details": str(e),
+                    "request_id": request_id
+                }
+            }
+            return JSONResponse(status_code=504, content=error_content)
+        except httpx.HTTPStatusError as e:
+            self.logger.error(f"HTTP error for streaming request {request_id}: {str(e)}")
+            error_content = {
+                "error": {
+                    "message": f"HTTP error {e.response.status_code} while streaming",
+                    "type": "stream_error",
+                    "details": str(e),
+                    "request_id": request_id,
+                    "status_code": e.response.status_code
+                }
+            }
+            return JSONResponse(status_code=e.response.status_code, content=error_content)
         except Exception as e:
-            self.logger.error(f"Error in streaming request {request_id}: {str(e)}")
-            error_content = {"error": {"message": str(e), "type": "stream_error"}}
-            return JSONResponse(
-                status_code=500,
-                content=error_content
-            )
+            self.logger.error(f"Unexpected error in streaming request {request_id}: {str(e)}", exc_info=True)
+            error_content = {
+                "error": {
+                    "message": f"Unexpected error while streaming: {str(e)}",
+                    "type": "stream_error",
+                    "details": str(e),
+                    "request_id": request_id
+                }
+            }
+            return JSONResponse(status_code=500, content=error_content)
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -252,6 +329,9 @@ class OpenAIProxy(BaseAPIProxy):
         # Rate limit retry settings
         self.max_retries = 3
         self.base_retry_delay = 1.0  # Initial delay in seconds
+        
+        # Token rate limiter
+        self.token_limiter = TokenRateLimiter(tpm_limit=30000)  # 30k TPM limit
     
     async def forward_request(self, request: Request, path: str, request_id: str = None):
         """Forward request to OpenAI API"""
@@ -375,6 +455,26 @@ class OpenAIProxy(BaseAPIProxy):
                 # Parse the JSON
                 try:
                     body = json.loads(body_bytes)
+                    
+                    # For chat completions, check token limits
+                    if path in ["chat/completions", "completions"]:
+                        # Calculate approximate token count
+                        # For chat/completions, count tokens in messages
+                        total_tokens = 0
+                        if "messages" in body:
+                            for msg in body["messages"]:
+                                # Rough estimation: 1 token ≈ 4 characters
+                                content = msg.get("content", "")
+                                if isinstance(content, str):
+                                    total_tokens += len(content) // 4
+                        
+                        # Add max_tokens if specified
+                        max_tokens = body.get("max_tokens", 2000)  # default to 2000 if not specified
+                        total_tokens += max_tokens
+                        
+                        # Check token limit
+                        await self.token_limiter.check_token_limit(total_tokens)
+                    
                     if debug_mode:
                         # Log the full body without redaction
                         body_json = json.dumps(body)

@@ -8,7 +8,7 @@ class FilterConfig(BaseSettings):
     enabled: bool = True
     max_tokens: int = 8192
     allowed_models: List[str] = [
-        "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1",  "gpt-4o", "gpt-4o-mini", "text-embedding-ada-002",
+        "gpt-4.5-preview", "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4.1",  "gpt-4o", "gpt-4o-mini", "text-embedding-ada-002",
         "claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307",
         "claude-3-5-sonnet-20240620", "claude-3-7-sonnet-20250219"
     ]
