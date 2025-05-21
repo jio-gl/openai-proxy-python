@@ -8,6 +8,7 @@ OpenAI Proxy is a secure proxy server that sits between your application and the
 2. **Request/Response Logging**: Logs all API interactions for analysis
 3. **Security Filtering**: Validates API requests against security rules
 4. **Cost Control**: Monitors and potentially limits API usage
+5. **Multi-Provider Support**: Seamlessly routes requests to OpenAI, Anthropic, or Cerebras based on the endpoint
 
 ## Quick Start
 
@@ -64,6 +65,141 @@ response = openai.ChatCompletion.create(
 )
 ```
 
+## Multi-Provider Support
+
+The proxy supports routing requests to different AI providers based on the endpoint path.
+
+### Cerebras AI Integration
+
+The proxy automatically routes chat/completions and completions requests to Cerebras AI. To use Cerebras AI:
+
+1. Set your Cerebras API key in the `.env` file:
+   ```
+   CEREBRAS_API_KEY=your-cerebras-api-key
+   ```
+
+2. Install the Cerebras SDK:
+   ```bash
+   pip install cerebras-cloud-sdk>=0.1.0
+   ```
+
+3. Make API requests as you normally would with OpenAI. The proxy will automatically route the request to Cerebras AI with the appropriate model (`llama-3.3-70b` by default).
+
+Example using the OpenAI client to access Cerebras:
+
+```python
+import openai
+
+# Use the proxy URL, which will route to Cerebras automatically
+openai.api_base = "http://localhost:8000/v1"
+openai.api_key = "your-api-key" # This can be any value, as the proxy will use the Cerebras key
+
+# This will be automatically routed to Cerebras with llama-3.3-70b
+response = openai.ChatCompletion.create(
+    model="gpt-4",  # This will be replaced with llama-3.3-70b by the proxy
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What's the capital of France?"}
+    ]
+)
+
+print(response.choices[0].message.content)
+```
+
+#### Cerebras AI Tool Use
+
+When using tool calling with Cerebras AI, you need to follow the Cerebras format for defining tools. Note that the Cerebras API does not support the `system` parameter in the same way as the OpenAI API for tool definition.
+
+Here's how to properly define tools for Cerebras:
+
+```python
+import openai
+import json
+
+# Use the proxy URL, which will route to Cerebras
+openai.api_base = "http://localhost:8000/v1"
+openai.api_key = "your-api-key"  # This can be any value
+
+# Define the calculator function
+def calculate(expression):
+    try:
+        return str(eval(expression))
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Define the tool schema
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "strict": True,  # Important: ensures proper function schema validation
+            "description": "A calculator tool that can perform basic arithmetic operations",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "The mathematical expression to evaluate"
+                    }
+                },
+                "required": ["expression"]
+            }
+        }
+    }
+]
+
+# Make the API call
+messages = [
+    {"role": "user", "content": "What's the result of 15 multiplied by 7?"}
+]
+
+response = openai.ChatCompletion.create(
+    model="gpt-4",  # Will be routed to llama-3.3-70b
+    messages=messages,
+    tools=tools,
+    parallel_tool_calls=False  # Important: set to False for Cerebras
+)
+
+# Handle the tool calls
+if response.choices[0].message.tool_calls:
+    # Add the assistant's message with the tool call to the conversation
+    messages.append(response.choices[0].message)
+    
+    # Process each tool call
+    for tool_call in response.choices[0].message.tool_calls:
+        function_name = tool_call.function.name
+        arguments = json.loads(tool_call.function.arguments)
+        
+        # Execute the calculator function
+        if function_name == "calculate":
+            result = calculate(arguments["expression"])
+            
+            # Add the tool response to the conversation
+            messages.append({
+                "role": "tool",
+                "content": result,
+                "tool_call_id": tool_call.id
+            })
+    
+    # Get the final response with the calculation result
+    final_response = openai.ChatCompletion.create(
+        model="gpt-4",  # Will be routed to llama-3.3-70b
+        messages=messages
+    )
+    
+    print(final_response.choices[0].message.content)
+else:
+    print(response.choices[0].message.content)
+```
+
+### Other Providers
+
+The proxy also supports routing to:
+
+- **OpenAI**: Default routing for all non-specific endpoints
+- **Anthropic**: For Claude models via Anthropic's API
+
 ## Features
 
 ### Private Network Masking
@@ -118,6 +254,9 @@ OPENAI_ORG_ID=your-organization-id  # Optional: Your OpenAI organization ID
 # Anthropic API settings (optional)
 ANTHROPIC_API_KEY=your-anthropic-api-key
 ANTHROPIC_API_BASE_URL=https://api.anthropic.com
+
+# Cerebras API settings (optional)
+CEREBRAS_API_KEY=your-cerebras-api-key
 
 # Logging settings
 LOG_LEVEL=INFO  # Set to DEBUG for more detailed logs
@@ -178,6 +317,19 @@ If you see "OpenAI-Organization header should match organization for API key" er
 2. Ensure you're not setting a different organization ID in your client
 3. Restart the proxy server
 
+### Cerebras API Issues
+
+Common issues with Cerebras API integration:
+
+1. **"Unexpected keyword argument 'system'"**: This occurs because Cerebras API does not support the `system` parameter in the same way as OpenAI. Remove any `system` parameter from your Cerebras requests or use the `messages` parameter with a system role message instead.
+
+2. **Tool use errors**: Ensure you're using the Cerebras format for tool definitions (see Cerebras AI Tool Use section above). Key differences include:
+   - Set `strict: True` in the function object
+   - Set `parallel_tool_calls=False` in API calls
+   - Use the correct format for sending tool results back to the model
+
+3. **Missing Python SDK**: Ensure you've installed the Cerebras SDK with `pip install cerebras-cloud-sdk>=0.1.0`
+
 ### Debug Mode Issues
 
 If you encounter issues with debug mode:
@@ -214,6 +366,12 @@ docker-compose up -d
 
 ## Recent Changes
 
+### Version 1.3.0
+
+- Added Cerebras AI integration with automatic routing to Cerebras for chat/completions
+- Fixed tool use implementation for Cerebras API
+- Added better error handling for multi-provider routing
+
 ### Version 1.2.0
 
 - Completely redesigned debug mode for improved reliability
@@ -237,6 +395,7 @@ The proxy is built with FastAPI and uses:
 - `httpx` for making HTTP requests
 - `uvicorn` as the ASGI server
 - Custom middleware for request/response handling
+- Provider-specific adapters for routing to different AI APIs
 
 ## License
 
