@@ -1005,7 +1005,7 @@ class CerebrasProxy(BaseAPIProxy):
         super().__init__(settings)
         self.api_key = os.environ.get("CEREBRAS_API_KEY")
         self.model = "llama-3.3-70b"
-        self.token_limiter = TokenRateLimiter(tpm_limit=3000000)
+        self.token_limiter = TokenRateLimiter(tpm_limit=30000)
         self.client = None
         self._initialize_client()
 
@@ -1042,38 +1042,6 @@ class CerebrasProxy(BaseAPIProxy):
                     body = json.loads(body_bytes)
                     # Force model to llama-3.3-70b
                     body["model"] = self.model
-                    
-                    # Handle system parameter (Cerebras doesn't support it directly)
-                    # Instead, transform it to a message with role "system"
-                    if "system" in body:
-                        self.logger.info("Converting 'system' parameter to system role message")
-                        system_content = body.pop("system")
-                        if "messages" in body:
-                            # Check if there's already a system message
-                            has_system_message = False
-                            for msg in body["messages"]:
-                                if msg.get("role") == "system":
-                                    has_system_message = True
-                                    break
-                            
-                            # If no system message exists, add it at the beginning
-                            if not has_system_message:
-                                body["messages"].insert(0, {"role": "system", "content": system_content})
-                        else:
-                            # If no messages at all, create a messages array with system message
-                            body["messages"] = [{"role": "system", "content": system_content}]
-                    
-                    # Properly handle tools for Cerebras
-                    if "tools" in body:
-                        for tool in body.get("tools", []):
-                            if tool.get("type") == "function" and "function" in tool:
-                                # Ensure 'strict' is set to True for Cerebras
-                                tool["function"]["strict"] = True
-                        
-                        # Cerebras requires parallel_tool_calls=False
-                        if "parallel_tool_calls" not in body:
-                            body["parallel_tool_calls"] = False
-                    
                     # Token limit check
                     total_tokens = 0
                     if "messages" in body:
@@ -1127,29 +1095,26 @@ class CerebrasProxy(BaseAPIProxy):
             )
 
         try:
-            # Create a clean copy of the body without unsupported parameters
-            cerebras_body = {k: v for k, v in body.items() if k not in ["system"]}
-            
             # Handle streaming requests
-            if "stream" in cerebras_body and cerebras_body["stream"] is True:
+            if "stream" in body and body["stream"] is True:
                 if debug_mode:
                     self.logger.debug(f"Handling streaming request for {request_id}")
                 
-                if "messages" in cerebras_body:
+                if "messages" in body:
                     # Chat completions
                     stream = self.client.chat.completions.create(
-                        messages=cerebras_body["messages"],
+                        messages=body["messages"],
                         model=self.model,
                         stream=True,
-                        **{k: v for k, v in cerebras_body.items() if k not in ["messages", "model", "stream"]}
+                        **{k: v for k, v in body.items() if k not in ["messages", "model", "stream"]}
                     )
                 else:
                     # Text completions
                     stream = self.client.completions.create(
-                        prompt=cerebras_body["prompt"],
+                        prompt=body["prompt"],
                         model=self.model,
                         stream=True,
-                        **{k: v for k, v in cerebras_body.items() if k not in ["prompt", "model", "stream"]}
+                        **{k: v for k, v in body.items() if k not in ["prompt", "model", "stream"]}
                     )
 
                 async def stream_generator():
@@ -1186,19 +1151,19 @@ class CerebrasProxy(BaseAPIProxy):
                 )
 
             # Handle non-streaming requests
-            if "messages" in cerebras_body:
+            if "messages" in body:
                 # Chat completions
                 response = self.client.chat.completions.create(
-                    messages=cerebras_body["messages"],
+                    messages=body["messages"],
                     model=self.model,
-                    **{k: v for k, v in cerebras_body.items() if k not in ["messages", "model"]}
+                    **{k: v for k, v in body.items() if k not in ["messages", "model"]}
                 )
             else:
                 # Text completions
                 response = self.client.completions.create(
-                    prompt=cerebras_body["prompt"],
+                    prompt=body["prompt"],
                     model=self.model,
-                    **{k: v for k, v in cerebras_body.items() if k not in ["prompt", "model"]}
+                    **{k: v for k, v in body.items() if k not in ["prompt", "model"]}
                 )
 
             # Convert response to dict
@@ -1290,7 +1255,7 @@ class CerebrasProxy(BaseAPIProxy):
             for i, chunk in enumerate(chunks):
                 # Serialize and send
                 chunk_data = json.dumps(chunk)
-                yield f"data: {chunk_data}\r\n\r\n".encode('utf-8')
+                yield f"data: {chunk_data}\n\n".encode("utf-8")
                 
                 # In debug mode, don't add delays to avoid test timeouts
                 if not debug_mode:
@@ -1572,10 +1537,8 @@ class AnthropicProxy(BaseAPIProxy):
                             "Access-Control-Expose-Headers": "*"
                         })
                         return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                    except Exception as json_error:
+                    except:
                         # Just return the raw response content with the modified headers
-                        if debug_mode:
-                            self.logger.debug(f"Non-JSON response, returning raw content: {str(json_error)}")
                         self.request_logger.log_response(
                             request_id, 
                             status_code, 
@@ -1644,10 +1607,8 @@ class AnthropicProxy(BaseAPIProxy):
                             "Access-Control-Expose-Headers": "*"
                         })
                         return SafeJSONResponse(content=response_body, status_code=status_code, headers=response_headers)
-                    except Exception as json_error:
+                    except:
                         # Just return the raw response content with the modified headers
-                        if debug_mode:
-                            self.logger.debug(f"Non-JSON fallback response: {str(json_error)}")
                         self.request_logger.log_response(
                             request_id, 
                             status_code, 
@@ -1715,7 +1676,7 @@ class AnthropicProxy(BaseAPIProxy):
                 {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "! This is a mock "}},
                 {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "response from the Anthropic API Firewall."}},
                 {"type": "content_block_stop", "index": 0},
-                {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None, "usage": {"output_tokens": 10}}},
                 {"type": "message_stop"}
             ]
             
